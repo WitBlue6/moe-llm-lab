@@ -1,0 +1,12 @@
+{
+  "vocab_size": 16384,
+  "hidden_size": 768,
+  "num_layers": 16,
+  "num_attention_heads": 12,
+  "num_key_value_heads": 4,
+  "expert_intermediate_size": 1536,
+  "num_experts": 4,
+  "experts_per_token": 2,
+  "max_seq_len": 2048,
+  "gradient_checkpointing": true
+}

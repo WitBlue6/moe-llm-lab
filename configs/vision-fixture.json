@@ -1,0 +1,10 @@
+{
+  "encoder_type": "fixture",
+  "image_token_grid": 2,
+  "lora_rank": 4,
+  "lora_alpha": 8.0,
+  "fixture_image_size": 16,
+  "fixture_patch_size": 4,
+  "fixture_hidden_size": 16,
+  "fixture_seed": 1234
+}

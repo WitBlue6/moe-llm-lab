@@ -1,0 +1,12 @@
+{
+  "stage": "pretrain",
+  "max_steps": 8,
+  "batch_size": 2,
+  "grad_accum_steps": 2,
+  "learning_rate": 0.002,
+  "warmup_steps": 1,
+  "precision": "fp32",
+  "device": "cpu",
+  "eval_every": 4,
+  "save_every": 4
+}

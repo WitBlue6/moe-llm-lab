@@ -1,0 +1,8 @@
+{
+  "encoder_type": "siglip",
+  "encoder_path": "models/siglip-base-patch16-224",
+  "image_token_grid": 8,
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "lora_targets": ["q_proj", "v_proj"]
+}

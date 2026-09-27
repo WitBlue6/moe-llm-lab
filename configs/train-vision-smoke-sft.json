@@ -1,0 +1,13 @@
+{
+  "stage": "sft",
+  "max_steps": 4,
+  "batch_size": 2,
+  "grad_accum_steps": 2,
+  "learning_rate": 0.003,
+  "adapter_lr_ratio": 1.0,
+  "warmup_steps": 0,
+  "precision": "fp32",
+  "device": "cpu",
+  "eval_every": 2,
+  "save_every": 2
+}

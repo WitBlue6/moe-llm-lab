@@ -1,0 +1,15 @@
+# 项目约定
+
+- 使用 uv 管理环境，运行命令使用 `uv run --locked`；提交 uv.lock 和 .python-version，不使用 pip 手改环境。
+- 目标是理解并验证从零搭建 MoE、预训练和后训练的完整过程；核心网络与训练目标用原生 PyTorch 实现。
+- 文本网络、预训练/SFT、视觉投影层与视觉 LoRA 已实现。DPO、PPO、奖励模型、独立文本 LoRA、GRPO 尚未实现；synthetic smoke test 不代表模型能力。
+- 新增环境依赖时使用 uv 并更新锁文件。正式训练前确认服务器 Python、驱动与 CUDA 兼容性。
+- 修改网络、路由、损失、数据掩码或分布式归一化后运行相应测试。
+- 正式实验保存配置、数据与 tokenizer 指纹、代码版本、种子、checkpoint 来源、GPU 时间与显存。
+- 不覆盖已有输出；不提交密钥、原始数据、模型权重。测试数据与训练数据隔离。
+- MoE 同时报总参数和每 token 激活参数；理论激活量不能当作实测速度。
+- 不宣称未经对照实验验证的 RL 或 MoE 提升。路线见 docs/roadmap.md。
+
+- 视觉基座权重及 tokenizer 保持不变；无图片时必须关闭视觉 LoRA。测试纯文本 logits 与原基座一致。
+- 视觉 LoRA 启用状态通过 forward 参数显式传递，不能用会在 activation checkpoint 重计算前复位的临时全局开关。
+- 视觉训练/验证按图片内容哈希分组，不按问答行随机切分。fixture 编码器不是预训练视觉模型。

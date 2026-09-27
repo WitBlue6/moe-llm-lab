@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moe-llm-lab"
+version = "0.3.0"
+description = "Readable from-scratch MoE pretraining and post-training lab"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = ["torch>=2.5,<3", "tokenizers>=0.21,<0.23", "numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+vision = ["transformers>=4.51,<5", "pillow>=10.4,<13"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+moe-lab = "moe_llm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+required-version = ">=0.7.9"

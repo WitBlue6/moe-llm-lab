@@ -1,5 +1,6 @@
 import io
 import json
+from datetime import datetime
 
 import pytest
 
@@ -33,7 +34,10 @@ def test_redirected_output_is_json_and_worker_is_silent(monkeypatch):
     record = {'step': 1, 'train_loss': 2.}
     with TrainingProgress(rank=0, total=1, start=0, steps_per_epoch=1, stream=stream) as p:
         log_json(record)
-    assert json.loads(stream.getvalue()) == record
+    logged = json.loads(stream.getvalue())
+    assert datetime.fromisoformat(logged.pop('timestamp')).utcoffset() is not None
+    assert logged == record
+    assert 'timestamp' not in record
     assert '\r' not in stream.getvalue() and p.status == 'done'
     worker = Terminal()
     with TrainingProgress(rank=2, total=1, start=0, steps_per_epoch=1, stream=worker) as p:

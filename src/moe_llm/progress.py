@@ -1,4 +1,5 @@
 """Rank-zero terminal progress; JSON logs stay usable in redirected output."""
+from datetime import datetime
 import json
 import os
 import shutil
@@ -9,12 +10,18 @@ import time
 _active = None
 
 
+def format_record(record):
+    # Timestamp emission using the host's local timezone; keep JSONL valid and
+    # leave the original metrics/checkpoint data untouched.
+    return json.dumps({**record, 'timestamp': datetime.now().astimezone().isoformat(timespec='seconds')})
+
+
 def log_json(record):
     """Print an event above the live line, without modifying the logged record."""
     if _active is not None:
         _active.log(record)
     else:
-        print(json.dumps(record), flush=True)
+        print(format_record(record), flush=True)
 
 
 class TrainingProgress:
@@ -92,6 +99,6 @@ class TrainingProgress:
         if record.get('event') == 'validation_start':
             self.status = 'validate'
         self.clear()
-        self.stream.write(json.dumps(record) + '\n')
+        self.stream.write(format_record(record) + '\n')
         self.stream.flush()
         self.render()

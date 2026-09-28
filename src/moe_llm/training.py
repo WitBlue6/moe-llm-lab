@@ -5,6 +5,8 @@ with dynamically unused experts takes priority over communication optimization.
 """
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
+from .progress import TrainingProgress, log_json
+
 import json
 import math
 import os
@@ -227,8 +229,8 @@ def evaluate(model, dataset, batch_size, device, precision, rank=0, world=1, max
     record_count = len(dataset) if max_batches is None else min(len(dataset), max_batches * batch_size * world)
     subset = Subset(dataset, range(rank, record_count, world))
     if rank == 0:
-        print(json.dumps({"event": "validation_start", "val_records": record_count,
-                          "val_total_records": len(dataset), "eval_max_batches_per_rank": max_batches}), flush=True)
+        log_json({"event": "validation_start", "val_records": record_count,
+                          "val_total_records": len(dataset), "eval_max_batches_per_rank": max_batches})
     loader = DataLoader(subset, batch_size=batch_size, collate_fn=collate,
                         generator=torch.Generator().manual_seed(0))
     totals = torch.zeros(2, dtype=torch.float64, device=device)
@@ -283,8 +285,8 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
     if stop_after is not None and stop_after > config.max_steps:
         raise ValueError("stop_after must lie within the configured schedule")
     if rank == 0:
-        print(json.dumps({"event": "training_budget", "epochs": config.epochs,
-                          "max_steps": config.max_steps, "steps_per_epoch": steps_per_epoch}), flush=True)
+        log_json({"event": "training_budget", "epochs": config.epochs,
+                          "max_steps": config.max_steps, "steps_per_epoch": steps_per_epoch})
     if manifest["stage"] != config.stage or manifest["tokenizer_sha256"] != tok.fingerprint:
         raise ValueError("dataset stage/tokenizer differs from training configuration")
     if model_config.vocab_size != tok.vocab_size:
@@ -359,72 +361,77 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     last_metrics = {}
-    for step in range(start, end):
-        batches = stream.next_group(config.grad_accum_steps, finish_epoch=config.epochs is not None)
-        denominators = torch.tensor([
-            sum(int((b["labels"] != -100).sum()) for b in batches),
-            sum(int(b["attention_mask"].sum()) for b in batches),
-        ], device=device, dtype=torch.float64)
-        sum_across_ranks(denominators)
-        if denominators.min().item() <= 0:
-            raise ValueError("empty token group")
-        lr = learning_rate_at(step, config)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-        optimizer.zero_grad(set_to_none=True)
-        # CE sum, weighted auxiliary loss, weighted entropy, expert selection fractions.
-        totals = torch.zeros(3, dtype=torch.float64, device=device)
-        usage = torch.zeros(model_config.num_layers, model_config.num_experts, device=device)
-        for batch in batches:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            count = batch["attention_mask"].sum()
-            with amp_context(device, config.precision):
-                out = wrapped(batch["input_ids"], attention_mask=batch["attention_mask"])
-                ce_sum, _ = causal_loss_sum(out["logits"], batch["labels"])
-                # DDP averages gradients, hence the compensating world-size factor.
-                loss = ce_sum * (world / denominators[0]).float()
-                loss = loss + config.aux_loss_coef * out["aux_loss"] * (world * count / denominators[1]).float()
-            scaler.scale(loss).backward()
-            totals += torch.stack((ce_sum.detach().double(), out["aux_loss"].detach().double() * count,
-                                   out["router_entropy"].double() * count))
-            usage += out["expert_usage"] * count
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        finite = torch.tensor(int(torch.isfinite(grad_norm)), device=device)
-        if world > 1:
-            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-        if not finite.item():
-            raise FloatingPointError("non-finite gradients; checkpoint not advanced; reduce LR/use bf16 or fp32")
-        scaler.step(optimizer)
-        scaler.update()
-        sum_across_ranks(totals)
-        sum_across_ranks(usage)
-        trained_tokens += int(denominators[0].item())
-        elapsed = time.perf_counter() - wall_start
-        last_metrics = {"step": step + 1, "epochs_completed": stream.epoch + stream.cursor / len(stream.loader),
-                       "train_loss": (totals[0] / denominators[0]).item(),
-                       "aux_loss": (totals[1] / denominators[1]).item(),
-                       "router_entropy": (totals[2] / denominators[1]).item(),
-                       "expert_usage": (usage / denominators[1]).tolist(), "learning_rate": lr,
-                       "grad_norm": grad_norm.item(), "trained_tokens": trained_tokens,
-                       "supervised_tokens_this_step": int(denominators[0].item()),
-                       "input_tokens_this_step": int(denominators[1].item()),
-                       "supervised_tokens_per_second_this_run": (trained_tokens - tokens_at_start) / max(elapsed, 1e-9),
-                       "elapsed_seconds_this_run": elapsed, "allocated_gpu_seconds_this_run": elapsed * world if device.type == "cuda" else 0}
-        if (step + 1) % config.eval_every == 0 or step + 1 == end:
-            last_metrics.update(evaluate(model, val_data, config.batch_size, device, config.precision, rank, world, eval_max_batches))
-        if device.type == "cuda":
-            memory = torch.tensor(torch.cuda.max_memory_allocated(device), device=device)
+    with TrainingProgress(rank=rank, total=config.max_steps, start=start,
+                          steps_per_epoch=steps_per_epoch, epochs=config.epochs) as progress:
+        for step in range(start, end):
+            progress.phase("train")
+            batches = stream.next_group(config.grad_accum_steps, finish_epoch=config.epochs is not None)
+            denominators = torch.tensor([
+                sum(int((b["labels"] != -100).sum()) for b in batches),
+                sum(int(b["attention_mask"].sum()) for b in batches),
+            ], device=device, dtype=torch.float64)
+            sum_across_ranks(denominators)
+            if denominators.min().item() <= 0:
+                raise ValueError("empty token group")
+            lr = learning_rate_at(step, config)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+            # CE sum, weighted auxiliary loss, weighted entropy, expert selection fractions.
+            totals = torch.zeros(3, dtype=torch.float64, device=device)
+            usage = torch.zeros(model_config.num_layers, model_config.num_experts, device=device)
+            for batch in batches:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                count = batch["attention_mask"].sum()
+                with amp_context(device, config.precision):
+                    out = wrapped(batch["input_ids"], attention_mask=batch["attention_mask"])
+                    ce_sum, _ = causal_loss_sum(out["logits"], batch["labels"])
+                    # DDP averages gradients, hence the compensating world-size factor.
+                    loss = ce_sum * (world / denominators[0]).float()
+                    loss = loss + config.aux_loss_coef * out["aux_loss"] * (world * count / denominators[1]).float()
+                scaler.scale(loss).backward()
+                totals += torch.stack((ce_sum.detach().double(), out["aux_loss"].detach().double() * count,
+                                       out["router_entropy"].double() * count))
+                usage += out["expert_usage"] * count
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            finite = torch.tensor(int(torch.isfinite(grad_norm)), device=device)
             if world > 1:
-                dist.all_reduce(memory, op=dist.ReduceOp.MAX)
-            last_metrics["max_rank_peak_memory_bytes"] = memory.item()
-        if rank == 0:
-            with (root / "metrics.jsonl").open("a") as handle:
-                handle.write(json.dumps(last_metrics) + "\n")
-            print(json.dumps({k: v for k, v in last_metrics.items() if k != "expert_usage"}), flush=True)
-        if (step + 1) % config.save_every == 0 or step + 1 == end:
-            write_checkpoint(root, model, optimizer, scaler, step + 1, stream, config, provenance,
-                             device, rank, world, trained_tokens)
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not finite.item():
+                raise FloatingPointError("non-finite gradients; checkpoint not advanced; reduce LR/use bf16 or fp32")
+            scaler.step(optimizer)
+            scaler.update()
+            sum_across_ranks(totals)
+            sum_across_ranks(usage)
+            trained_tokens += int(denominators[0].item())
+            elapsed = time.perf_counter() - wall_start
+            last_metrics = {"step": step + 1, "epochs_completed": stream.epoch + stream.cursor / len(stream.loader),
+                           "train_loss": (totals[0] / denominators[0]).item(),
+                           "aux_loss": (totals[1] / denominators[1]).item(),
+                           "router_entropy": (totals[2] / denominators[1]).item(),
+                           "expert_usage": (usage / denominators[1]).tolist(), "learning_rate": lr,
+                           "grad_norm": grad_norm.item(), "trained_tokens": trained_tokens,
+                           "supervised_tokens_this_step": int(denominators[0].item()),
+                           "input_tokens_this_step": int(denominators[1].item()),
+                           "supervised_tokens_per_second_this_run": (trained_tokens - tokens_at_start) / max(elapsed, 1e-9),
+                           "elapsed_seconds_this_run": elapsed, "allocated_gpu_seconds_this_run": elapsed * world if device.type == "cuda" else 0}
+            progress.update(last_metrics)
+            if (step + 1) % config.eval_every == 0 or step + 1 == end:
+                last_metrics.update(evaluate(model, val_data, config.batch_size, device, config.precision, rank, world, eval_max_batches))
+            if device.type == "cuda":
+                memory = torch.tensor(torch.cuda.max_memory_allocated(device), device=device)
+                if world > 1:
+                    dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+                last_metrics["max_rank_peak_memory_bytes"] = memory.item()
+            if rank == 0:
+                with (root / "metrics.jsonl").open("a") as handle:
+                    handle.write(json.dumps(last_metrics) + "\n")
+                log_json({k: v for k, v in last_metrics.items() if k != "expert_usage"})
+            if (step + 1) % config.save_every == 0 or step + 1 == end:
+                progress.phase("save")
+                write_checkpoint(root, model, optimizer, scaler, step + 1, stream, config, provenance,
+                                 device, rank, world, trained_tokens)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - wall_start

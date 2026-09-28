@@ -5,6 +5,8 @@ DDP uses differentiable all-gather of text features; each local image sees all
 ranks' captions as negatives. No gradient accumulation: it would not enlarge
 the contrastive negative pool. Eval uses a fixed, explicitly sized candidate set.
 """
+from .progress import TrainingProgress, log_json
+
 import argparse
 from dataclasses import asdict
 import json
@@ -222,9 +224,9 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
         raise FileExistsError(f'use a NEW output directory: {root}')
     if rank == 0:
         root.mkdir(parents=True)
-        print(json.dumps({'event': 'training_budget', 'epochs': c.get('epochs'),
+        log_json({'event': 'training_budget', 'epochs': c.get('epochs'),
                           'max_steps': c['max_steps'],
-                          'steps_per_epoch': len(train_data) // (world * c['batch_size'])}), flush=True)
+                          'steps_per_epoch': len(train_data) // (world * c['batch_size'])})
         (root / 'run.json').write_text(json.dumps({'config': c, 'provenance': provenance,
             'parameters': sum(p.numel() for p in raw.parameters()), 'global_batch': world * c['batch_size']}, indent=2))
     if world > 1:
@@ -234,72 +236,78 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
         restore_rng(state['rng'][rank], device)
     sampler = DistributedSampler(train_data, num_replicas=world, rank=rank, seed=seed, shuffle=True, drop_last=True)
     started, initial_images = time.perf_counter(), trained_images
-    while step < end:
-        sampler.set_epoch(epoch)
-        loader = DataLoader(train_data, batch_size=c['batch_size'], sampler=sampler, drop_last=True,
-                            collate_fn=collate_pairs, num_workers=0, generator=torch.Generator().manual_seed(seed + epoch))
-        for index, batch in enumerate(loader):
-            if index < cursor:
-                continue
-            t = step
-            warmup = c['warmup_steps']
-            factor = (t + 1) / warmup if t < warmup else .1 + .9 * .5 * (1 + math.cos(math.pi * (t - warmup) / max(1, c['max_steps'] - warmup - 1)))
-            lr = c['learning_rate'] * factor
-            for group in optimizer.param_groups:
-                group['lr'] = lr
-            optimizer.zero_grad(set_to_none=True)
-            with amp_context(device, c.get('precision', 'bf16')):
-                outputs = model(*(x.to(device) for x in batch))
-            loss = distributed_loss(outputs, rank, world)
-            if not torch.isfinite(loss):
-                raise FloatingPointError('nonfinite contrastive loss')
-            loss.backward()
-            grad = nn.utils.clip_grad_norm_(raw.parameters(), 1., error_if_nonfinite=True)
-            optimizer.step()
-            step += 1; cursor = index + 1; trained_images += c['batch_size'] * world
-            loss_value = loss.detach()
-            if world > 1:
-                dist.all_reduce(loss_value); loss_value /= world
-            metrics = {'step': step, 'epochs_completed': epoch + cursor / len(loader),
-                       'train_loss': loss_value.item(), 'grad_norm': grad.item(),
-                       'learning_rate': lr, 'trained_images': trained_images, 'global_batch': c['batch_size'] * world}
-            if step % c['eval_every'] == 0 or step == end:
+    with TrainingProgress(rank=rank, total=c['max_steps'], start=step,
+                          steps_per_epoch=len(train_data) // (world * c['batch_size']),
+                          epochs=c.get('epochs')) as progress:
+        while step < end:
+            sampler.set_epoch(epoch)
+            loader = DataLoader(train_data, batch_size=c['batch_size'], sampler=sampler, drop_last=True,
+                                collate_fn=collate_pairs, num_workers=0, generator=torch.Generator().manual_seed(seed + epoch))
+            for index, batch in enumerate(loader):
+                if index < cursor:
+                    continue
+                progress.phase("train")
+                t = step
+                warmup = c['warmup_steps']
+                factor = (t + 1) / warmup if t < warmup else .1 + .9 * .5 * (1 + math.cos(math.pi * (t - warmup) / max(1, c['max_steps'] - warmup - 1)))
+                lr = c['learning_rate'] * factor
+                for group in optimizer.param_groups:
+                    group['lr'] = lr
+                optimizer.zero_grad(set_to_none=True)
+                with amp_context(device, c.get('precision', 'bf16')):
+                    outputs = model(*(x.to(device) for x in batch))
+                loss = distributed_loss(outputs, rank, world)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('nonfinite contrastive loss')
+                loss.backward()
+                grad = nn.utils.clip_grad_norm_(raw.parameters(), 1., error_if_nonfinite=True)
+                optimizer.step()
+                step += 1; cursor = index + 1; trained_images += c['batch_size'] * world
+                loss_value = loss.detach()
+                if world > 1:
+                    dist.all_reduce(loss_value); loss_value /= world
+                metrics = {'step': step, 'epochs_completed': epoch + cursor / len(loader),
+                           'train_loss': loss_value.item(), 'grad_norm': grad.item(),
+                           'learning_rate': lr, 'trained_images': trained_images, 'global_batch': c['batch_size'] * world}
+                progress.update(metrics)
+                if step % c['eval_every'] == 0 or step == end:
+                    if rank == 0:
+                        log_json({'event': 'validation_start', 'max_samples': c['eval_samples']})
+                        metrics.update(evaluate_pairs(raw, val_data, device, c['batch_size'], c['eval_samples']))
+                    if world > 1:
+                        dist.barrier()
+                elapsed = time.perf_counter() - started
+                metrics.update(elapsed_seconds_this_run=elapsed, allocated_gpu_seconds_this_run=elapsed * world if device.type == 'cuda' else 0,
+                               images_per_second_this_run=(trained_images - initial_images) / max(elapsed, 1e-9))
+                peak = torch.tensor(torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0, device=device)
+                if world > 1:
+                    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+                metrics['max_rank_peak_memory_bytes'] = peak.item()
                 if rank == 0:
-                    print(json.dumps({'event': 'validation_start', 'max_samples': c['eval_samples']}), flush=True)
-                    metrics.update(evaluate_pairs(raw, val_data, device, c['batch_size'], c['eval_samples']))
-                if world > 1:
-                    dist.barrier()
-            elapsed = time.perf_counter() - started
-            metrics.update(elapsed_seconds_this_run=elapsed, allocated_gpu_seconds_this_run=elapsed * world if device.type == 'cuda' else 0,
-                           images_per_second_this_run=(trained_images - initial_images) / max(elapsed, 1e-9))
-            peak = torch.tensor(torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0, device=device)
-            if world > 1:
-                dist.all_reduce(peak, op=dist.ReduceOp.MAX)
-            metrics['max_rank_peak_memory_bytes'] = peak.item()
-            if rank == 0:
-                with (root / 'metrics.jsonl').open('a') as f:
-                    f.write(json.dumps(metrics) + '\n')
-                print(json.dumps(metrics), flush=True)
-            if step % c['save_every'] == 0 or step == end:
-                local_rng = rng_state(device)
-                states = [None] * world
-                if world > 1:
-                    dist.all_gather_object(states, local_rng)
-                else:
-                    states = [local_rng]
-                if rank == 0:
-                    target = root / f'step-{step:07d}.pt'
-                    payload = {'format': 'moe-lab-siglip-training-v1', 'config': c, 'manifest': manifest,
-                        'provenance': provenance, 'model': raw.state_dict(), 'optimizer': optimizer.state_dict(),
-                        'step': step, 'epoch': epoch, 'cursor': cursor, 'trained_images': trained_images, 'rng': states}
-                    temporary = target.with_suffix('.tmp')
-                    torch.save(payload, temporary); temporary.rename(target)
-                if world > 1:
-                    dist.barrier()
-            if step == end:
-                break
-        if step < end:
-            epoch += 1; cursor = 0
+                    with (root / 'metrics.jsonl').open('a') as f:
+                        f.write(json.dumps(metrics) + '\n')
+                    log_json(metrics)
+                if step % c['save_every'] == 0 or step == end:
+                    progress.phase("save")
+                    local_rng = rng_state(device)
+                    states = [None] * world
+                    if world > 1:
+                        dist.all_gather_object(states, local_rng)
+                    else:
+                        states = [local_rng]
+                    if rank == 0:
+                        target = root / f'step-{step:07d}.pt'
+                        payload = {'format': 'moe-lab-siglip-training-v1', 'config': c, 'manifest': manifest,
+                            'provenance': provenance, 'model': raw.state_dict(), 'optimizer': optimizer.state_dict(),
+                            'step': step, 'epoch': epoch, 'cursor': cursor, 'trained_images': trained_images, 'rng': states}
+                        temporary = target.with_suffix('.tmp')
+                        torch.save(payload, temporary); temporary.rename(target)
+                    if world > 1:
+                        dist.barrier()
+                if step == end:
+                    break
+            if step < end:
+                epoch += 1; cursor = 0
     if rank == 0:
         (root / 'summary.json').write_text(json.dumps(metrics, indent=2))
     return metrics

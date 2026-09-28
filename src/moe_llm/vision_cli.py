@@ -24,6 +24,8 @@ def register(commands):
     train.add_argument("--output", required=True)
     train.add_argument("--image-root")
     train.add_argument("--stop-after", type=int)
+    train.add_argument("--eval-max-batches", type=int,
+                       help="limit each validation to this many batches per rank; default: full validation")
     parent = train.add_mutually_exclusive_group()
     parent.add_argument("--init-from")
     parent.add_argument("--resume")
@@ -71,7 +73,7 @@ def dispatch(args):
     elif args.command == "vision-train":
         train_visual(args.base_checkpoint, VisionConfig.load(args.vision_config),
                      VisualTrainConfig.load(args.train_config), args.data, args.tokenizer, args.output,
-                     args.init_from, args.resume, args.stop_after, args.image_root)
+                     args.init_from, args.resume, args.stop_after, args.image_root, args.eval_max_batches)
     else:
         torch.set_num_threads(1)
         device = select_device(args.device)

@@ -140,4 +140,12 @@ uv run --locked --extra vision python scripts/smoke.py --output runs/full-smoke-
 
 新命令：`vision-prepare`、`vision-train`、`vision-generate`、`vision-evaluate`、`vision-fixture`。`vision-evaluate --text-data ...` 比较 VLM 无图路径与原基座的 logits；`--zero-images` 提供图像置零对照。详见训练指南第 9–13 步。
 
+`train` 和 `vision-train` 均支持 `--eval-max-batches N`：每次定期/末尾验证每卡最多 N 批，不传则全量验证。短跑建议 `--stop-after 9 --eval-max-batches 9`，正式训练示例采用每卡 128 批，并在训练后单独全量评测。独立 `vision-evaluate` 不继承训练上限；SigLIP 对比训练使用配置中的 `eval_samples`。
+
+## 参考项目
+
+本项目的学习路线与实现设计参考了 [MiniMind](https://github.com/jingyaogong/minimind) 和 [MiniMind-V](https://github.com/jingyaogong/minimind-v)：前者提供小型语言模型从网络搭建到预训练、SFT 的实践参考，后者提供视觉编码器、投影层与语言模型连接的 VLM 实践参考。感谢两个项目的开源工作。相关数据来源与许可证另见 [数据指南](docs/data-guide.md) 和训练指南第 10 步。
+
+本项目实现了原生 PyTorch MoE、两种视觉权重来源，以及有图启用、无图关闭的视觉 LoRA，并检查纯文本路径与原始基座一致。MiniMind-V 本身也支持纯文本和 MoE；这些支持不能作为本项目独有的功能，也尚无实验结论证明本项目效果优于参考项目。
+
 [逐步训练指南](docs/training-guide.md) · [实现细节与限制](docs/design.md) · [后续路线](docs/roadmap.md) · [本地验证记录](docs/validation.md)

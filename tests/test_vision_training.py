@@ -59,3 +59,33 @@ def test_visual_alignment_sft_resume_and_text_retention(tmp_path, tiny):
     make_base(other, tiny)
     with pytest.raises(ValueError, match="base checkpoint"):
         load_visual_model(other, full / "step-0000004.pt", "byte", torch.device("cpu"))
+
+
+def test_visual_eval_limit_and_full_default(tmp_path, tiny):
+    from moe_llm.vision_training import evaluate_visual
+    from moe_llm.vision_data import VisualDataset
+    base = tmp_path / "base.pt"
+    make_base(base, tiny)
+    vc = VisionConfig(encoder_type="fixture", image_token_grid=2)
+    raw = create_visual_fixture(tmp_path / "raw")
+    data = tmp_path / "data"
+    prepare_visual([raw["jsonl"]], raw["image_root"], data, "byte", vc, 128, .25)
+    c = VisualTrainConfig(max_steps=2, warmup_steps=0, batch_size=1, grad_accum_steps=1,
+                          device="cpu", precision="fp32", eval_every=1, save_every=2)
+    output = tmp_path / "limited"
+    result = train_visual(base, vc, c, data, "byte", output, stop_after=1, eval_max_batches=1)
+    assert result["val_records"] == 1 and result["val_full"] is False
+    checkpoint = output / "step-0000001.pt"
+    assert load_visual_checkpoint(checkpoint)["provenance"]["eval_max_batches_per_rank"] == 1
+    model, _ = load_visual_model(base, checkpoint, "byte", torch.device("cpu"))
+    dataset = VisualDataset(data, "val", vc)
+    expected = evaluate_visual(model, torch.utils.data.Subset(dataset, [0]), 1, torch.device("cpu"), "fp32")
+    assert result["val_loss"] == pytest.approx(expected["val_loss"])
+    assert result["val_tokens"] == expected["val_tokens"]
+    full = evaluate_visual(model, dataset, 1, torch.device("cpu"), "fp32")
+    assert full["val_full"] and full["val_records"] == len(dataset)
+    assert full["val_tokens"] > result["val_tokens"]
+    for invalid in (0, -1):
+        with pytest.raises(ValueError, match="positive"):
+            train_visual(base, vc, c, data, "byte", tmp_path / "invalid", eval_max_batches=invalid)
+    assert not (tmp_path / "invalid").exists()

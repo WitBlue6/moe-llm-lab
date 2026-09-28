@@ -89,9 +89,15 @@ def load_visual_model(base_checkpoint, checkpoint, tokenizer_path, device, encod
 
 
 @torch.inference_mode()
-def evaluate_visual(model, dataset, batch_size, device, precision, rank=0, world=1, zero_images=False):
+def evaluate_visual(model, dataset, batch_size, device, precision, rank=0, world=1, zero_images=False, max_batches=None):
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be positive")
+    record_count = len(dataset) if max_batches is None else min(len(dataset), max_batches * batch_size * world)
+    if rank == 0:
+        print(json.dumps({"event": "validation_start", "val_records": record_count,
+                          "val_total_records": len(dataset), "eval_max_batches_per_rank": max_batches}), flush=True)
     model.eval()
-    loader = DataLoader(Subset(dataset, range(rank, len(dataset), world)), batch_size=batch_size,
+    loader = DataLoader(Subset(dataset, range(rank, record_count, world)), batch_size=batch_size,
                         collate_fn=collate_visual, generator=torch.Generator().manual_seed(0))
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     for batch in loader:
@@ -110,7 +116,8 @@ def evaluate_visual(model, dataset, batch_size, device, precision, rank=0, world
     model.train()
     prefix = "zero_image" if zero_images else "val"
     return {f"{prefix}_loss": ce, f"{prefix}_perplexity": math.exp(min(ce, 80)),
-            f"{prefix}_tokens": int(totals[1].item())}
+            f"{prefix}_tokens": int(totals[1].item()), f"{prefix}_records": record_count,
+            f"{prefix}_total_records": len(dataset), f"{prefix}_full": record_count == len(dataset)}
 
 
 def save_visual(root, model, config, identity, provenance, optimizer, scaler, step, stream,
@@ -139,13 +146,15 @@ def save_visual(root, model, config, identity, provenance, optimizer, scaler, st
 
 
 def train_visual(base_checkpoint, vision_config, config, data_path, tokenizer_path, output,
-                 init_from=None, resume=None, stop_after=None, image_root=None):
+                 init_from=None, resume=None, stop_after=None, image_root=None, eval_max_batches=None):
     if init_from and resume:
         raise ValueError("choose init_from or resume")
     if config.stage == "sft" and not (init_from or resume):
         raise ValueError("visual SFT requires an alignment adapter via --init-from")
     if stop_after is not None and not 1 <= stop_after <= config.max_steps:
         raise ValueError("invalid stop_after")
+    if eval_max_batches is not None and eval_max_batches < 1:
+        raise ValueError("eval_max_batches must be positive")
     torch.set_num_threads(config.cpu_threads)
     rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     device = select_device(config.device)
@@ -153,14 +162,14 @@ def train_visual(base_checkpoint, vision_config, config, data_path, tokenizer_pa
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
     try:
         return _train_visual(base_checkpoint, vision_config, config, data_path, tokenizer_path, output,
-                             init_from, resume, stop_after, image_root, device, rank, world)
+                             init_from, resume, stop_after, image_root, device, rank, world, eval_max_batches)
     finally:
         if world > 1 and dist.is_initialized():
             dist.destroy_process_group()
 
 
 def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, init_from, resume,
-                  stop_after, image_root, device, rank, world):
+                  stop_after, image_root, device, rank, world, eval_max_batches):
     with amp_context(device, c.precision):
         pass
     random.seed(c.seed)
@@ -185,7 +194,7 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
                   "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
                   "base_checkpoint": str(base_checkpoint), "parent": str(resume or init_from) if state else None,
                   "parent_sha256": sha256_file(resume or init_from) if state else None,
-                  "fixture_vision": vc.encoder_type == "fixture"}
+                  "fixture_vision": vc.encoder_type == "fixture", "eval_max_batches_per_rank": eval_max_batches}
     if resume:
         if state["train_config"] != asdict(c):
             raise ValueError("exact visual resume requires unchanged train config")
@@ -284,7 +293,8 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
                    "grad_norm": grad_norm.item(), "trained_tokens": trained_tokens,
                    "supervised_tokens_this_step": int(denominators[0].item()), "input_tokens_this_step": int(denominators[1].item())}
         if (step + 1) % c.eval_every == 0 or step + 1 == end:
-            metrics.update(evaluate_visual(model, val_data, c.batch_size, device, c.precision, rank, world))
+            metrics.update(evaluate_visual(model, val_data, c.batch_size, device, c.precision, rank, world,
+                                           max_batches=eval_max_batches))
         if device.type == "cuda":
             memory = torch.tensor(torch.cuda.max_memory_allocated(device), device=device)
             if world > 1:

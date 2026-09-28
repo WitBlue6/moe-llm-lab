@@ -539,7 +539,19 @@ uv run --locked --extra vision moe-lab vision-prepare \
 
 ## 11. 视觉对齐：只训练投影层
 
-先完成第 9 步的 fixture smoke，再执行正式训练。**当前视觉训练没有 `--eval-max-batches` 参数**；`vision-train --stop-after 10` 仍会在最后一步跑完整视觉验证集，不能套用文本短跑命令来避免长等待。下面的正式视觉训练仍每 100 步及结束时全量验证，验证结束后才打印该步日志并保存 checkpoint，请预留时间：
+先完成第 9 步的 fixture smoke，并同步更新服务器的 `src/moe_llm/vision_cli.py` 和 `src/moe_llm/vision_training.py`。`vision-train` 支持 `--eval-max-batches`，限制每次定期验证与末尾验证的每卡批次数；不传则仍然全量验证。`--stop-after` 只控制训练停止步数。
+
+先做单卡短跑，当前 batch_size=1，末尾最多验证 9 条记录：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --locked --extra vision moe-lab vision-train \
+  --base-checkpoint runs/text-sft-001/step-0000500.pt \
+  --vision-config configs/vision-active.json --train-config configs/train-vision-align.json \
+  --data data/vision-align-v1 --tokenizer data/tokenizer-v1.json \
+  --output runs/vision-align-pilot-1gpu --stop-after 9 --eval-max-batches 9
+```
+
+确认保存了 `step-0000009.pt` 与 `summary.json`。八卡短跑可使用下方 torchrun 命令，将输出改为新的 `runs/vision-align-pilot-8gpu`，并把末尾改为 `--stop-after 10 --eval-max-batches 9`，最多验证 72 条记录。短跑通过后正式运行：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
@@ -547,16 +559,29 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
   --base-checkpoint runs/text-sft-001/step-0000500.pt \
   --vision-config configs/vision-active.json --train-config configs/train-vision-align.json \
   --data data/vision-align-v1 --tokenizer data/tokenizer-v1.json \
-  --output runs/vision-align-001
+  --output runs/vision-align-001 --eval-max-batches 128
 ```
 
 冻结视觉编码器和文本 LLM，只有 projector 进入优化器。LLM 前向仍保留对输入的梯度，使损失能够回传到 projector。图文回答使用与文本 SFT 相同的 assistant-only 监督原则，视觉位置不作为预测目标。
 
 检查 loss/验证趋势、显存和训练参数量。冻结 LLM 不等于训练几乎不占显存，仍需其前向与向输入反传的激活。
 
+正式示例每卡最多验证 128 批，八卡 batch_size=1 时最多使用验证集固定前 1024 条，并按 rank 无重复分片。上限不改变 `eval_every`，默认仍每 100 步及结束时验证；结束时也使用这个子集。日志会先打印 `validation_start`，再记录 `val_records`、`val_total_records`、`val_full`；run/checkpoint 记录验证上限。比较验证 loss 时保持 GPU 数、batch size 和验证上限一致。
+
 ## 12. 视觉 SFT：投影层＋视觉 LoRA
 
-同样按视觉训练配置定期及结束时进行全量验证。以下假设视觉对齐训练了 1000 步并在指定目录保存；调整了总步数或恢复目录时，必须同步修改 `--init-from`。
+以下假设视觉对齐训练了 1000 步并在指定目录保存；调整了总步数或恢复目录时，必须同步修改 `--init-from`。先从选中的对齐 checkpoint 做单卡 SFT 短跑：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --locked --extra vision moe-lab vision-train \
+  --base-checkpoint runs/text-sft-001/step-0000500.pt \
+  --vision-config configs/vision-active.json --train-config configs/train-vision-sft.json \
+  --data data/vision-sft-v1 --tokenizer data/tokenizer-v1.json \
+  --init-from runs/vision-align-001/step-0001000.pt \
+  --output runs/vision-sft-pilot-1gpu --stop-after 9 --eval-max-batches 9
+```
+
+确认第 9 步保存正常后，正式 SFT 重新从同一对齐 checkpoint 开始。定期及结束验证均使用每卡最多 128 批：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
@@ -565,18 +590,30 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
   --vision-config configs/vision-active.json --train-config configs/train-vision-sft.json \
   --data data/vision-sft-v1 --tokenizer data/tokenizer-v1.json \
   --init-from runs/vision-align-001/step-0001000.pt \
-  --output runs/vision-sft-001
+  --output runs/vision-sft-001 --eval-max-batches 128
 ```
 
 默认 LoRA 作用在各层注意力的 Q/V 投影，rank=8；MoE router、专家、embedding 和原始注意力权重都保持冻结。投影层和 LoRA 使用不同学习率，记录在 run.json/metrics.jsonl。
 
 这个版本采用**视觉适配器模式**：有图片时启用视觉 LoRA，无图片时关闭。它没有实现“始终开启 LoRA 的图文＋纯文本混合更新”训练器；因为原始文本路径完全不更新，所以本模式无需靠文本回放来抵消遗忘。后续可以把统一混合训练作为独立对照实验。
 
-恢复同一视觉 run 时改用 `--resume`，保留相同 `--base-checkpoint`、配置、数据、GPU 数与代码，并换新输出目录。不要把视觉适配器 checkpoint 当成独立完整 LLM；推理还需要原始 SFT 基座和同一份视觉编码器。
+恢复同一视觉 run 时改用 `--resume`，移除 `--init-from`，保留相同 `--base-checkpoint`、配置、数据、GPU 数与代码，并换新输出目录。恢复时也显式传入 `--eval-max-batches 128`，否则会恢复成默认全量验证。下面要求第 500 步文件实际存在：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
+  --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli vision-train \
+  --base-checkpoint runs/text-sft-001/step-0000500.pt \
+  --vision-config configs/vision-active.json --train-config configs/train-vision-sft.json \
+  --data data/vision-sft-v1 --tokenizer data/tokenizer-v1.json \
+  --resume runs/vision-sft-001/step-0000500.pt \
+  --output runs/vision-sft-001-resumed --eval-max-batches 128
+```
+
+如在恢复目录完成训练，下面评测/生成的 checkpoint 路径也改为该目录。视觉对齐恢复同理，使用对齐配置和对齐 checkpoint。不要把视觉适配器 checkpoint 当成独立完整 LLM；推理还需要原始 SFT 基座和同一份视觉编码器。
 
 ## 13. 视觉能力与文本保留验收
 
-下面会依次全量运行正常图片验证、`--zero-images` 对照，并对整个文本验证集比较两套模型的 logits，耗时可能明显长于单次验证。目前不支持验证批次数上限；不要当作快速 smoke。文件名假设视觉 SFT 完成了 1000 步。
+下面是独立的训练后全量验收，会依次运行正常图片验证、`--zero-images` 对照，并对整个文本验证集比较两套模型的 logits，耗时可能明显长于单次验证。`vision-evaluate` 不支持 `--eval-max-batches`，也不会继承训练时的验证上限；不要当作快速 smoke。文件名假设视觉 SFT 完成了 1000 步。
 
 ```bash
 uv run --locked --extra vision moe-lab vision-evaluate \
@@ -631,8 +668,8 @@ uv run --locked --extra vision moe-lab vision-generate \
 | CUDA unavailable | GPU 驱动与锁定的 PyTorch CUDA wheel；先通过 doctor |
 | uv 找不到包/无法下载 | 网络、包镜像和 uv 配置；不要删锁文件绕过复现 |
 | 显存不足 | batch、序列长度、其他 GPU 进程、checkpointing；视觉 tokens 也占上下文 |
-| 最后一步或每 100 步长期没有新日志 | 文本训练检查 `validation_start` 的样本数；短跑加 `--eval-max-batches 9`，正式文本训练用固定子集并另做全量评测；视觉暂为全量验证 |
-| unrecognized arguments: --eval-max-batches | 同步更新文本 cli.py 和 training.py；该参数仅用于 `train`，不支持 `evaluate` 或 `vision-train` |
+| 最后一步或每 100 步长期没有新日志 | 文本/视觉训练检查 `validation_start` 的样本数；短跑加 `--eval-max-batches 9`，正式训练用固定子集并另做全量评测 |
+| unrecognized arguments: --eval-max-batches | 同步相应 cli.py/training.py 或 vision_cli.py/vision_training.py；该参数用于 `train` 和 `vision-train`，不支持独立 `evaluate`、`vision-evaluate` 或 SigLIP 对比训练入口 |
 | 配置/词表不匹配 | tokenizer 是否更换，是否使用 configure 生成的模型配置 |
 | SFT 样本几乎全跳过 | manifest 的 overlong_sft；整理数据或用新目录准备更长窗口 |
 | 输出目录已存在 | 更换新目录；恢复也用新目录，不覆盖已有实验 |

@@ -37,7 +37,8 @@ def test_two_rank_visual_alignment_sft_and_resume(tmp_path, tiny):
     command = [sys.executable, "-m", "torch.distributed.run", "--rdzv-backend=c10d",
                "--rdzv-endpoint=127.0.0.1:0", "--local-addr=127.0.0.1", "--rdzv-conf=is_host=true",
                "--nnodes=1", "--nproc-per-node=2", "-m", "moe_llm.cli", "vision-train",
-               "--base-checkpoint", str(base), "--vision-config", str(vc_path), "--data", str(data)]
+               "--base-checkpoint", str(base), "--vision-config", str(vc_path), "--data", str(data),
+               "--eval-max-batches", "1"]
     env = {**os.environ, "OMP_NUM_THREADS": "1"}
     if sys.platform == "darwin":
         env["GLOO_SOCKET_IFNAME"] = "lo0"
@@ -49,6 +50,8 @@ def test_two_rank_visual_alignment_sft_and_resume(tmp_path, tiny):
         result = subprocess.run([*command, "--train-config", str(config), "--output", str(tmp_path / name), *extra],
                                 capture_output=True, text=True, timeout=60, env=env)
         assert result.returncode == 0, result.stdout + result.stderr
+        summary = json.loads((tmp_path / name / "summary.json").read_text())
+        assert summary["val_records"] == 4 and summary["val_full"] is False
     full = load_visual_checkpoint(tmp_path / "full/step-0000004.pt")
     resumed = load_visual_checkpoint(tmp_path / "resumed/step-0000004.pt")
     assert len(full["rng_states"]) == full["world_size"] == 2

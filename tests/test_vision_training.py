@@ -89,3 +89,9 @@ def test_visual_eval_limit_and_full_default(tmp_path, tiny):
         with pytest.raises(ValueError, match="positive"):
             train_visual(base, vc, c, data, "byte", tmp_path / "invalid", eval_max_batches=invalid)
     assert not (tmp_path / "invalid").exists()
+    # One epoch smaller than the accumulation window must stop at its boundary.
+    c = replace(c, epochs=1, grad_accum_steps=100)
+    result = train_visual(base, vc, c, data, "byte", tmp_path / "epoch", eval_max_batches=1)
+    assert result['step'] == 1 and result['epochs_completed'] == 1
+    trained = load_visual_checkpoint(tmp_path / 'epoch/step-0000001.pt')
+    assert trained['train_config']['max_steps'] == trained['train_config']['epochs'] == 1

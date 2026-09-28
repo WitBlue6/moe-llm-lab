@@ -1,5 +1,6 @@
 """Optional vision commands, registered without importing optional dependencies."""
 import json
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -24,6 +25,7 @@ def register(commands):
     train.add_argument("--output", required=True)
     train.add_argument("--image-root")
     train.add_argument("--stop-after", type=int)
+    train.add_argument("--epochs", type=int, help="positive whole epochs; overrides config epochs and max_steps")
     train.add_argument("--eval-max-batches", type=int,
                        help="limit each validation to this many batches per rank; default: full validation")
     parent = train.add_mutually_exclusive_group()
@@ -71,8 +73,11 @@ def dispatch(args):
         print(json.dumps(prepare_visual(args.input, args.image_root, args.output, args.tokenizer,
             VisionConfig.load(args.vision_config), args.max_seq_len, args.val_ratio, args.seed), indent=2))
     elif args.command == "vision-train":
+        config = VisualTrainConfig.load(args.train_config)
+        if args.epochs is not None:
+            config = replace(config, epochs=args.epochs)
         train_visual(args.base_checkpoint, VisionConfig.load(args.vision_config),
-                     VisualTrainConfig.load(args.train_config), args.data, args.tokenizer, args.output,
+                     config, args.data, args.tokenizer, args.output,
                      args.init_from, args.resume, args.stop_after, args.image_root, args.eval_max_batches)
     else:
         torch.set_num_threads(1)

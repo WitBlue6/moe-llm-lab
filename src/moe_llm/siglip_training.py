@@ -148,8 +148,22 @@ def build_model(config, manifest):
         manifest['text_length'], config.get('projection_size', 256), config.get('text_layers', 4))
 
 
-def train_pairs(config, data, output, tokenizer_path, stop_after=None, resume=None, image_root=None):
+def train_pairs(config, data, output, tokenizer_path, stop_after=None, resume=None, image_root=None, epochs=None):
     c = dict(config)
+    if epochs is not None:
+        c['epochs'] = epochs
+    requested_epochs = c.get('epochs')
+    if requested_epochs is not None and (type(requested_epochs) is not int or requested_epochs < 1):
+        raise ValueError('epochs must be a positive integer')
+    world = int(os.environ.get('WORLD_SIZE', 1))
+    if requested_epochs is not None:
+        if c['batch_size'] < 1:
+            raise ValueError('batch_size must be positive')
+        manifest = json.loads((Path(data) / 'manifest.json').read_text())
+        steps_per_epoch = manifest['split_records']['train'] // (world * c['batch_size'])
+        if not steps_per_epoch:
+            raise ValueError('epoch training requires at least one complete global batch')
+        c['max_steps'] = requested_epochs * steps_per_epoch
     for key in ('max_steps', 'batch_size', 'eval_every', 'save_every', 'eval_samples'):
         if c[key] < 1:
             raise ValueError(f'{key} must be positive')
@@ -208,6 +222,9 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
         raise FileExistsError(f'use a NEW output directory: {root}')
     if rank == 0:
         root.mkdir(parents=True)
+        print(json.dumps({'event': 'training_budget', 'epochs': c.get('epochs'),
+                          'max_steps': c['max_steps'],
+                          'steps_per_epoch': len(train_data) // (world * c['batch_size'])}), flush=True)
         (root / 'run.json').write_text(json.dumps({'config': c, 'provenance': provenance,
             'parameters': sum(p.numel() for p in raw.parameters()), 'global_batch': world * c['batch_size']}, indent=2))
     if world > 1:
@@ -243,7 +260,8 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
             loss_value = loss.detach()
             if world > 1:
                 dist.all_reduce(loss_value); loss_value /= world
-            metrics = {'step': step, 'train_loss': loss_value.item(), 'grad_norm': grad.item(),
+            metrics = {'step': step, 'epochs_completed': epoch + cursor / len(loader),
+                       'train_loss': loss_value.item(), 'grad_norm': grad.item(),
                        'learning_rate': lr, 'trained_images': trained_images, 'global_batch': c['batch_size'] * world}
             if step % c['eval_every'] == 0 or step == end:
                 if rank == 0:
@@ -323,6 +341,7 @@ def main(argv=None):
     for key in ('config', 'data', 'output', 'tokenizer'):
         p.add_argument('--' + key, required=True)
     p.add_argument('--stop-after', type=int)
+    p.add_argument('--epochs', type=int, help='positive whole epochs; overrides config epochs and max_steps')
     p.add_argument('--resume')
     p.add_argument('--image-root')
     p = commands.add_parser('export')
@@ -339,7 +358,7 @@ def main(argv=None):
               args.text_length, args.seed, args.val_ratio), indent=2))
     elif args.command == 'train':
         train_pairs(json.loads(Path(args.config).read_text()), args.data, args.output, args.tokenizer,
-                    args.stop_after, args.resume, args.image_root)
+                    args.stop_after, args.resume, args.image_root, args.epochs)
     elif args.command == 'export':
         export_encoder(args.checkpoint, args.output)
     else:

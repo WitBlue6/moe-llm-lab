@@ -16,7 +16,8 @@ from torch.utils.data import DataLoader, Subset
 from .model import LanguageModel, ModelConfig, causal_loss_sum
 from .tokenizer import TextTokenizer, sha256_file
 from .training import (TrainConfig, BatchStream, select_device, amp_context, learning_rate_at,
-                       sum_across_ranks, rng_state, restore_rng, load_checkpoint, code_fingerprint, git_revision)
+                       sum_across_ranks, rng_state, restore_rng, load_checkpoint, code_fingerprint, git_revision,
+                       resolve_training_budget)
 from .vision import VisionConfig, VisionLanguageModel, encoder_fingerprint
 from .vision_data import VisualDataset, collate_visual
 
@@ -151,7 +152,7 @@ def train_visual(base_checkpoint, vision_config, config, data_path, tokenizer_pa
         raise ValueError("choose init_from or resume")
     if config.stage == "sft" and not (init_from or resume):
         raise ValueError("visual SFT requires an alignment adapter via --init-from")
-    if stop_after is not None and not 1 <= stop_after <= config.max_steps:
+    if stop_after is not None and stop_after < 1:
         raise ValueError("invalid stop_after")
     if eval_max_batches is not None and eval_max_batches < 1:
         raise ValueError("eval_max_batches must be positive")
@@ -182,6 +183,12 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
     train_data = VisualDataset(data_path, "train", vc, image_root)
     val_data = VisualDataset(data_path, "val", vc, image_root)
     manifest = train_data.manifest
+    c, steps_per_epoch = resolve_training_budget(c, len(train_data), world)
+    if stop_after is not None and stop_after > c.max_steps:
+        raise ValueError("stop_after must lie within the configured schedule")
+    if rank == 0:
+        print(json.dumps({"event": "training_budget", "epochs": c.epochs,
+                          "max_steps": c.max_steps, "steps_per_epoch": steps_per_epoch}), flush=True)
     if manifest["tokenizer_sha256"] != tok.fingerprint or manifest["max_seq_len"] > model.config.max_seq_len:
         raise ValueError("visual data tokenizer or context limit mismatch")
     import transformers
@@ -248,7 +255,7 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
         torch.cuda.reset_peak_memory_stats(device)
     metrics = {}
     for step in range(start, end):
-        batches = [stream.next() for _ in range(c.grad_accum_steps)]
+        batches = stream.next_group(c.grad_accum_steps, finish_epoch=c.epochs is not None)
         denominators = torch.tensor([sum(int((b["labels"] != -100).sum()) for b in batches),
                                      sum(int(b["attention_mask"].sum()) for b in batches)],
                                     dtype=torch.float64, device=device)
@@ -286,7 +293,8 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
         sum_across_ranks(totals)
         sum_across_ranks(usage)
         trained_tokens += int(denominators[0].item())
-        metrics = {"step": step + 1, "train_loss": (totals[0] / denominators[0]).item(),
+        metrics = {"step": step + 1, "epochs_completed": stream.epoch + stream.cursor / len(stream.loader),
+                   "train_loss": (totals[0] / denominators[0]).item(),
                    "aux_loss": (totals[1] / denominators[1]).item(), "router_entropy": (totals[2] / denominators[1]).item(),
                    "expert_usage": (usage / denominators[1]).tolist(), "projector_learning_rate": lr,
                    "lora_learning_rate": lr * c.adapter_lr_ratio if c.stage == "sft" else 0.,

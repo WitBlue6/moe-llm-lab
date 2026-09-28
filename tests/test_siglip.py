@@ -94,3 +94,10 @@ def test_scratch_training_resume_export_and_frozen_vlm(tmp_path, tiny):
     visual = {k: {json.loads(x)['image'] for x in (prepared / f'{k}.jsonl').read_text().splitlines()} for k in ('train', 'val')}
     pairs = {k: {json.loads(x)['image'] for x in (data / f'{k}.jsonl').read_text().splitlines()} for k in ('train', 'val')}
     assert pairs == visual
+    # Scratch contrastive epochs drop incomplete global batches, unlike VLM.
+    from moe_llm.siglip_training import PairDataset
+    count = len(PairDataset(data, 'train', 16))
+    epoch_config = {**c, 'batch_size': count - 1, 'max_steps': 99}
+    result = train_pairs(epoch_config, data, tmp_path / 'epoch', 'byte', epochs=1)
+    assert result['step'] == 1 and result['epochs_completed'] == 1
+    assert result['trained_images'] == count - 1

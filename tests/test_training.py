@@ -47,6 +47,49 @@ def test_scheduler_and_validation():
         config(grad_accum_steps=0)
 
 
+def test_epoch_budget_and_partial_accumulation():
+    from moe_llm.training import resolve_training_budget, BatchStream
+    c = config(epochs=2, batch_size=2, grad_accum_steps=3, warmup_steps=0)
+    resolved, steps = resolve_training_budget(c, 7, 1)
+    assert steps == 2 and resolved.max_steps == 4
+    stream = BatchStream(list(range(7)), c, 0, 1, collate_fn=lambda rows: rows)
+    for _ in range(2):
+        first = stream.next_group(3, finish_epoch=True)
+        last = stream.next_group(3, finish_epoch=True)
+        assert len(first) == 3 and len(last) == 1
+        assert sorted(sum(first + last, [])) == list(range(7))
+    # DDP sampler pads 7 records to 8, four records per rank.
+    resolved, steps = resolve_training_budget(c, 7, 2)
+    assert steps == 1 and resolved.max_steps == 2
+    for invalid in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="epochs"):
+            config(epochs=invalid)
+    with pytest.raises(ValueError, match="warmup"):
+        resolve_training_budget(config(epochs=1, warmup_steps=2), 1, 1)
+
+
+def test_epoch_training_tokens_and_resume(tmp_path, tiny):
+    from moe_llm.data import TokenDataset
+    from moe_llm.training import resolve_training_budget
+    data = tmp_path / "data"
+    prepare([FIXTURES / "pretrain.jsonl"], data, "byte", "pretrain", 64, .25)
+    dataset = TokenDataset(data, "train")
+    c = config(epochs=2, batch_size=2, grad_accum_steps=3, warmup_steps=0)
+    resolved, steps = resolve_training_budget(c, len(dataset), 1)
+    full = train(tiny, c, data, "byte", tmp_path / "full", eval_max_batches=1)
+    train(tiny, c, data, "byte", tmp_path / "part", stop_after=steps, eval_max_batches=1)
+    train(tiny, c, data, "byte", tmp_path / "resumed",
+          resume=tmp_path / f"part/step-{steps:07d}.pt", eval_max_batches=1)
+    end = resolved.max_steps
+    a = load_checkpoint(tmp_path / f"full/step-{end:07d}.pt")
+    b = load_checkpoint(tmp_path / f"resumed/step-{end:07d}.pt")
+    assert full["epochs_completed"] == 2 and full["step"] == end
+    expected_tokens = 2 * sum(int((dataset[i]['labels'] != -100).sum()) for i in range(len(dataset)))
+    assert a['trained_tokens'] == b['trained_tokens'] == expected_tokens
+    for key in a['model']:
+        torch.testing.assert_close(a['model'][key], b['model'][key], atol=0, rtol=0)
+
+
 def test_pilot_limits_validation_and_saves_checkpoint(tmp_path, tiny):
     from moe_llm.data import TokenDataset
     from moe_llm.training import evaluate

@@ -148,6 +148,49 @@ PY
 
 ## 5. 确认训练预算，做单卡和八卡短跑
 
+### 5.0 选择按 steps 或 epochs 训练
+
+文本 `moe-lab train`、视觉 `moe-lab vision-train` 和 `python -m moe_llm.siglip_training train` 均支持 `--epochs N`，N 必须是正整数，也可以在对应训练 JSON 中设置 `"epochs": N`。
+
+- 未指定 epochs：保留原有 `max_steps` 模式，本指南后续原有命令与 checkpoint 文件名仍按该模式演示。
+- 指定 epochs：CLI 值优先于 JSON，轮数覆盖 `max_steps`，按实际训练集、GPU 数、batch 与梯度累积计算总优化器步数，并据此安排 warmup/cosine。
+- `--stop-after K`：仍是全局优化器步号，仅用于短跑/提前停止，不改变 epochs 对应的完整学习率计划。K 不能超过计算后的总步数。
+- 恢复时保留同样的 `--epochs N`（或配置中的 epochs）、GPU 数、batch、累积、代码和数据。N 是整个 run 的总轮数，不是从 checkpoint 后再加 N 轮。不要修改旧 run 的预算后强行 resume。
+
+文本/视觉训练精确换算为：
+
+```text
+每卡样本数 = ceil(训练记录数 / GPU 数)
+每轮每卡微批数 = ceil(每卡样本数 / batch_size)
+每轮更新步数 = ceil(每轮每卡微批数 / grad_accum_steps)
+总步数 = epochs × 每轮更新步数
+```
+
+每轮末尾不足一次梯度累积的批次单独更新，按实际有效 token 数归一化，不从下一轮补齐。DDP 的采样器可能补少量重复记录以让每卡样本数相同。因此“一轮”指采样器的一轮，不保证每条原始记录恰好一次。
+
+SigLIP 对比训练不使用梯度累积，丢弃不足全局 batch 的尾部：每轮步数为 `floor(训练图文对数 / (GPU 数 × batch_size))`。它的负样本池要求各卡批次等长，因此与上述 ceil 规则不同。
+
+启动时会打印 `training_budget`：请求的 epochs、计算后的 max_steps、每轮步数；run/checkpoint 保存解析后的预算，训练日志新增 `epochs_completed`（按微批位置计算的轮进度）。如果 warmup_steps 大于等于计算后的总步数，会在开始训练前报错；请在新的配置中缩短 warmup，不会静默修改。
+
+以你的预训练数据 1,286,338 条、8 卡、batch1、累积8 为例，1 epoch 为 **20,100 个优化器 steps**。完成第 5.1–5.2 步短跑后，可选用以下命令训练一轮；它替代第 6 步的 1000-step 示例，不要两个都启动：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
+  --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli train \
+  --model-config configs/model-text-v1.json \
+  --train-config configs/text-pretrain-v1.json \
+  --data data/pretrain-v1 --tokenizer data/tokenizer-v1.json \
+  --output runs/text-pretrain-epoch1 --epochs 1 --eval-max-batches 128
+```
+
+本例最终文件为 `runs/text-pretrain-epoch1/step-0020100.pt`。若实际数据或 batch 不同，以启动预算和 summary 为准。后续生成、评测和 SFT 的 `--init-from` 必须指向你实际选中的 checkpoint，不能继续照抄 `step-0001000.pt`。SFT 和视觉阶段加 `--epochs 1` 同理，也要同步修改下一阶段引用的目录/步号。
+
+如果只是短跑，沿用相同完整预算并加 `--stop-after 9`、新输出目录；不要把 epochs 改小来模拟提前停止。SigLIP 训练的验证范围仍使用 `eval_samples`，不接收 `--eval-max-batches`。
+
+更新代码会改变严格恢复使用的代码指纹。已经开始的旧 run 请保留其原代码环境继续；新功能用于新的 run，或通过 `--init-from` 继承旧权重重新制定文本/VLM 计划（不恢复旧优化器）。SigLIP 从零训练入口目前只提供精确 resume，不提供 init-from。
+
+### 创建训练配置
+
 首次使用时复制训练配置，之后所有正式命令都用这份固定文件。你已创建下面两份配置，继续第 5.1 步即可，不要重复执行创建命令或覆盖配置：
 
 ```bash

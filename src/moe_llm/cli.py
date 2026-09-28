@@ -1,5 +1,5 @@
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -40,6 +40,7 @@ def main(argv=None):
     parent.add_argument("--init-from")
     parent.add_argument("--resume")
     training.add_argument("--stop-after", type=int, help="stop early without changing the LR scheduling horizon")
+    training.add_argument("--epochs", type=int, help="positive whole epochs; overrides config epochs and max_steps")
     training.add_argument("--eval-max-batches", type=int, help="limit each validation to this many batches per rank; default: full validation")
     for command in ("generate", "evaluate"):
         sub = commands.add_parser(command)
@@ -83,7 +84,10 @@ def main(argv=None):
         print(json.dumps(prepare(args.input, args.output, args.tokenizer, args.stage,
                                  args.max_seq_len, args.val_ratio, args.seed), indent=2))
     elif args.command == "train":
-        train(ModelConfig.load(args.model_config), TrainConfig.load(args.train_config),
+        config = TrainConfig.load(args.train_config)
+        if args.epochs is not None:
+            config = replace(config, epochs=args.epochs)
+        train(ModelConfig.load(args.model_config), config,
               args.data, args.tokenizer, args.output, args.init_from, args.resume, args.stop_after, args.eval_max_batches)
     else:
         torch.set_num_threads(1)

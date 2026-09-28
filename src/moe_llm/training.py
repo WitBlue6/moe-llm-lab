@@ -4,7 +4,7 @@ The first implementation synchronizes every microbatch deliberately: correctness
 with dynamically unused experts takes priority over communication optimization.
 """
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -28,6 +28,7 @@ from .tokenizer import TextTokenizer, sha256_file
 class TrainConfig:
     stage: str = "pretrain"
     max_steps: int = 1000
+    epochs: int | None = None
     batch_size: int = 1
     grad_accum_steps: int = 8
     learning_rate: float = 3e-4
@@ -44,6 +45,8 @@ class TrainConfig:
     cpu_threads: int = 1
 
     def __post_init__(self):
+        if self.epochs is not None and (type(self.epochs) is not int or self.epochs < 1):
+            raise ValueError("epochs must be a positive integer")
         if self.stage not in ("pretrain", "sft"):
             raise ValueError("only pretrain and sft are implemented")
         for name in ("max_steps", "batch_size", "grad_accum_steps", "eval_every", "save_every", "cpu_threads"):
@@ -51,7 +54,7 @@ class TrainConfig:
                 raise ValueError(f"{name} must be positive")
         if self.learning_rate <= 0 or self.grad_clip <= 0 or self.weight_decay < 0 or self.aux_loss_coef < 0:
             raise ValueError("invalid optimizer configuration")
-        if not 0 <= self.warmup_steps < self.max_steps or not 0 <= self.min_lr_ratio <= 1:
+        if self.warmup_steps < 0 or (self.epochs is None and self.warmup_steps >= self.max_steps) or not 0 <= self.min_lr_ratio <= 1:
             raise ValueError("invalid warmup or min_lr_ratio")
         if self.precision not in ("fp32", "bf16", "fp16") or self.device not in ("auto", "cpu", "cuda"):
             raise ValueError("unsupported device or precision")
@@ -59,6 +62,20 @@ class TrainConfig:
     @classmethod
     def load(cls, path):
         return cls(**json.loads(Path(path).read_text()))
+
+
+def resolve_training_budget(config, dataset_size, world):
+    """DDP pads its sampler to equal rank lengths; final accumulation is partial."""
+    samples_per_rank = (dataset_size + world - 1) // world
+    batches_per_epoch = (samples_per_rank + config.batch_size - 1) // config.batch_size
+    steps_per_epoch = (batches_per_epoch + config.grad_accum_steps - 1) // config.grad_accum_steps
+    if config.epochs is not None:
+        if not steps_per_epoch:
+            raise ValueError("epoch training requires nonempty training data")
+        config = replace(config, max_steps=config.epochs * steps_per_epoch)
+        if config.warmup_steps >= config.max_steps:
+            raise ValueError("warmup_steps must be smaller than the epoch-derived max_steps; use a new config with shorter warmup")
+    return config, steps_per_epoch
 
 
 def learning_rate_at(step, c):
@@ -126,6 +143,15 @@ class BatchStream:
             batch = next(self.iterator)
         self.cursor += 1
         return batch
+
+    def next_group(self, count, finish_epoch=False):
+        if finish_epoch:
+            if self.cursor == len(self.loader):
+                self.epoch += 1
+                self.cursor = 0
+                self._reset()
+            count = min(count, len(self.loader) - self.cursor)
+        return [self.next() for _ in range(count)]
 
 
 def rng_state(device):
@@ -226,8 +252,8 @@ def train(model_config, config, data_path, tokenizer_path, output, init_from=Non
         raise ValueError("init_from loads weights; resume restores training. Choose exactly one.")
     if config.stage == "sft" and not (init_from or resume):
         raise ValueError("SFT requires a pretrained --init-from checkpoint (or --resume)")
-    if stop_after is not None and not 1 <= stop_after <= config.max_steps:
-        raise ValueError("stop_after must lie within the configured schedule")
+    if stop_after is not None and stop_after < 1:
+        raise ValueError("stop_after must be positive")
     if eval_max_batches is not None and eval_max_batches < 1:
         raise ValueError("eval_max_batches must be positive")
     torch.set_num_threads(config.cpu_threads)
@@ -253,6 +279,12 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
     tok = TextTokenizer(tokenizer_path)
     train_data, val_data = TokenDataset(data_path, "train"), TokenDataset(data_path, "val")
     manifest = train_data.manifest
+    config, steps_per_epoch = resolve_training_budget(config, len(train_data), world)
+    if stop_after is not None and stop_after > config.max_steps:
+        raise ValueError("stop_after must lie within the configured schedule")
+    if rank == 0:
+        print(json.dumps({"event": "training_budget", "epochs": config.epochs,
+                          "max_steps": config.max_steps, "steps_per_epoch": steps_per_epoch}), flush=True)
     if manifest["stage"] != config.stage or manifest["tokenizer_sha256"] != tok.fingerprint:
         raise ValueError("dataset stage/tokenizer differs from training configuration")
     if model_config.vocab_size != tok.vocab_size:
@@ -328,7 +360,7 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
         torch.cuda.reset_peak_memory_stats(device)
     last_metrics = {}
     for step in range(start, end):
-        batches = [stream.next() for _ in range(config.grad_accum_steps)]
+        batches = stream.next_group(config.grad_accum_steps, finish_epoch=config.epochs is not None)
         denominators = torch.tensor([
             sum(int((b["labels"] != -100).sum()) for b in batches),
             sum(int(b["attention_mask"].sum()) for b in batches),
@@ -369,7 +401,8 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
         sum_across_ranks(usage)
         trained_tokens += int(denominators[0].item())
         elapsed = time.perf_counter() - wall_start
-        last_metrics = {"step": step + 1, "train_loss": (totals[0] / denominators[0]).item(),
+        last_metrics = {"step": step + 1, "epochs_completed": stream.epoch + stream.cursor / len(stream.loader),
+                       "train_loss": (totals[0] / denominators[0]).item(),
                        "aux_loss": (totals[1] / denominators[1]).item(),
                        "router_entropy": (totals[2] / denominators[1]).item(),
                        "expert_usage": (usage / denominators[1]).tolist(), "learning_rate": lr,

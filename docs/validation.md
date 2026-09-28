@@ -48,3 +48,12 @@ uv run --locked --extra vision python scripts/smoke.py --output <新的测试目
 - 图文混合更新共享权重、DPO、PPO、奖励模型、独立文本 LoRA 和 GRPO；这些尚未实现。
 
 开始正式训练前，按 training-guide.md 的环境诊断与 GPU 短跑逐项验收。
+
+## 2026-09-28：原生 SigLIP 与可选从零训练
+
+- 新增原生固定分辨率 SigLIP patch backbone、预处理和本地 safetensors 加载；HF 模型仅用于参考测试，不用于运行时网络构建。
+- 新增小规模 sigmoid 图文对比训练（随机图像/文本双编码器、跨卡带梯度负样本、按图片哈希划分、确定性验证子集、保存恢复、视觉 backbone 导出），不是官方训练配方复现。
+- 新增固定版本 MiniMind-V Parquet 下载计划、SHA256 校验和图片/会话/caption 转换；来源与许可见 training-guide 第 10 步。
+- `uv run --locked --extra vision pytest -q -p no:cacheprovider`：47 passed。覆盖随机小型参考编码器数值一致性、sigmoid 损失数学、双卡/Gloo 全局梯度等价、恢复一致、导出接入和既有文本/VLM 回归。
+- 训练指南 35 个 Bash 块通过 `bash -n`，36 条训练/数据命令通过 argparse 解析检查，未执行正式训练或完整数据下载。
+- 未完整下载官方视觉权重或约 9.26 GB 的视觉语料；未实测新编码器的 CUDA/NCCL、8×3090 显存吞吐、真实检索/VQA 效果。随机 fixture 测试不代表预训练视觉能力。

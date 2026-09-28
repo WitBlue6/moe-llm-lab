@@ -127,4 +127,4 @@ uv run --locked python scripts/convert_minimind.py \
 - [Ultra-FineWeb](https://huggingface.co/datasets/openbmb/Ultra-FineWeb)：其中中文部分约 120B tokens，可作为自然网页预训练数据扩展来源。总仓库体量很大，下一阶段应先选定中文分片与 token 预算，避免整库下载。
 - [Infinity-Instruct](https://huggingface.co/datasets/BAAI/Infinity-Instruct)：如 7M_core 子集，适合后续对比指令数据配方；需先在平台接受访问条件，核对 CC-BY-SA-4.0 条款，转换其实际字段。现有脚本专门适配 MiniMind，不保证适用这些数据。
 
-先用同一组固定题对比不同 checkpoint，再决定是否扩容；数据更多不自动意味着回答更好。目前先不下载 DPO 偏好对或 VLM 图片数据。
+先用同一组固定题对比不同 checkpoint，再决定是否扩容；数据更多不自动意味着回答更好。DPO 偏好对留待后续；视觉数据已提供独立下载与转换流程，见 [训练指南第 10 步](training-guide.md#101-数据来源与下载)。

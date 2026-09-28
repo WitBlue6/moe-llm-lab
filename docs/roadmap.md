@@ -14,7 +14,7 @@
 
 ## 视觉分支（已实现基础代码）
 
-冻结 SigLIP → projector 对齐 → projector+视觉 LoRA SFT → 图文生成与文本保留评测。支持单机 DDP、恢复和 adapter checkpoint。用户先按 training-guide.md 完成真实文本训练，再启动视觉训练。无图路径关闭视觉 LoRA；统一混合训练为未来对照。尚无正式视觉 checkpoint 或实测能力结论。
+手写 SigLIP 视觉网络：可读取兼容官方预训练参数，或训练随机初始化的图文双编码器（sigmoid 对比损失、跨卡负样本、检索评测、导出视觉 backbone）→ 冻结 SigLIP → projector 对齐 → projector+视觉 LoRA SFT → 图文生成与文本保留评测。支持单机 DDP、恢复和 adapter checkpoint。用户先按 training-guide.md 完成真实文本训练，再启动视觉训练。无图路径关闭视觉 LoRA；统一混合训练为未来对照。尚无正式视觉 checkpoint 或实测能力结论。
 
 ## 第二阶段：全参数 SFT 与独立文本 LoRA 对照
 

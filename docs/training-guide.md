@@ -330,7 +330,18 @@ uv run --locked moe-lab generate \
 
 **到这里，你要先开展的基础文本训练就完整了。** DPO、PPO 尚未实现；不需要等它们才能开始下一阶段视觉扩展。
 
-## 9. 文本基座合格后，再启用视觉依赖与权重
+## 9. 视觉网络与权重来源：二选一
+
+**两条路线都使用项目内手写的 PyTorch 视觉网络**（`src/moe_llm/siglip.py`）：patch embedding、位置编码、多头注意力、MLP、LayerNorm。运行时不调用 Transformers 的 `SiglipVisionModel.from_pretrained`；Transformers 暂保留在可选依赖中，用于数值对照测试。
+
+| 路线 | 网络实现 | 权重来源 | 适用目的 |
+| --- | --- | --- | --- |
+| A：加载已有权重 | 本项目手写网络 | Google 预训练 SigLIP 参数 | 先验证 VLM 连接层与视觉 LoRA |
+| B：自己训练 | 本项目手写网络＋独立文本编码器 | 两个编码器随机初始化，用图文对训练 | 学习视觉编码器预训练全过程 |
+
+路线 B 是小规模 **SigLIP 式训练**：采用 sigmoid 图文匹配损失、图像 mean pooling、文本 EOS pooling 和投影头；并非官方完整架构/训练配方复现，不保证达到官方预训练效果。现有 LLM 的 tokenizer 只负责切分描述文字，文本对比编码器也是新建并随机初始化，不加载或更新你的 LLM。训练完成后只导出视觉 backbone，文本对比编码器和对比投影头不会接入 VLM。
+
+安装依赖并做工程检查：
 
 ```bash
 uv sync --locked --extra vision
@@ -338,62 +349,193 @@ uv run --locked --extra vision pytest -q
 uv run --locked --extra vision python scripts/smoke.py --output runs/full-smoke-001 --vision
 ```
 
-full smoke 自动跑完微型文本预训练 → 文本 SFT → 视觉对齐 → 视觉 LoRA SFT → 图文生成，并检查视觉训练后纯文本 logits 与原基座相等。它使用随机冻结的 fixture 视觉编码器，**不能用其 checkpoint 做正式识图**。
+该 smoke 使用随机冻结的 fixture 编码器，不证明识图能力。新增的 SigLIP 测试覆盖原生/参考 patch 特征与预处理一致性、损失数学、跨卡负样本梯度、保存恢复、导出加载和无图文本保留。尚未在你的服务器验证新编码器的八卡吞吐或真实训练效果。
 
-正式视觉配置为 `configs/vision-siglip.json`。默认使用 [google/siglip-base-patch16-224](https://huggingface.co/google/siglip-base-patch16-224)：224×224 输入，原生 14×14 patch 网格，经固定平均池化变为 8×8，即 64 个视觉 tokens。冻结编码器，投影到语言模型 hidden size。
+此次需要同步 `src/`、`scripts/`、`configs/`、`tests/`、`docs/`、`pyproject.toml` 和 `uv.lock`。代码指纹会变化；已经开始的旧 run 若需要严格恢复，应保留其旧版代码/环境，不能用新版强行 resume。已完成的文本 SFT checkpoint 可以作为新版视觉训练的 `--base-checkpoint`。
 
-下载时固定当前仓库 commit；这一操作需要网络和权重磁盘空间，文本训练期间不用执行：
+### 9A. 加载兼容预训练权重
 
 ```bash
-uv run --locked --extra vision python - <<'PY'
-import json
+uv run --locked --extra vision python scripts/download_siglip_weights.py \
+  --output models/siglip-base-patch16-224
+```
+
+仅下载固定版本 `7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed` 的配置、预处理配置和 safetensors，不下载执行模型仓库代码。权重文件约 813 MB（原文件还含不使用的文本参数）；加载器只读取视觉 patch 路径所需张量，严格校验键名和形状。下载验证权重 SHA256，保存来源记录。此路线是“手写网络＋外部预训练权重”，不能称为权重也从零训练。
+
+如果之前已经下载过该目录，可保留原始配置/权重直接使用；新的下载脚本对没有自身下载记录的非空目录会拒绝写入，避免覆盖。网络不可达时可尝试给下载命令加 `HF_ENDPOINT=https://hf-mirror.com`，镜像可用性由第三方决定，校验仍必须通过。
+
+选择配置（新文件，不覆盖）：
+
+```bash
+uv run --locked python - <<'PY'
 from pathlib import Path
-from huggingface_hub import HfApi, snapshot_download
-repo = 'google/siglip-base-patch16-224'
-root = Path('models/siglip-base-patch16-224')
-if root.exists():
-    raise FileExistsError('目录已经存在，请确认原权重，或使用新目录并修改视觉配置。')
-revision = HfApi().model_info(repo).sha
-snapshot_download(repo_id=repo, revision=revision, local_dir=str(root),
-                  allow_patterns=['config.json', 'preprocessor_config.json', '*.safetensors', '*.safetensors.index.json'])
-(root / 'SOURCE.json').write_text(json.dumps({'repo_id': repo, 'revision': revision}, indent=2))
-print(repo, revision)
+with Path('configs/vision-active.json').open('x') as f:
+    f.write(Path('configs/vision-siglip.json').read_text())
 PY
 ```
 
-加载仅使用本地文件，不执行远程模型代码。正式配置不能换成 `vision-fixture.json`。视觉加载器会校验处理器、配置和权重指纹；冻结的视觉编码器总参数仍计入整个 VLM 的参数量，不能只报告 LLM+投影层。
+原生加载器当前兼容第一代 SigLIP 固定分辨率视觉 backbone；不能将 SigLIP2/NaFlex 仓库直接替换进去。默认 224×224、patch16，14×14 patch 经平均池化到 8×8，共 64 个视觉 tokens。
 
-## 10. 准备视觉对齐与视觉问答数据
+然后执行第 10.1–10.2 步准备视觉数据，跳过第 10.3 步的从零训练，进入第 11 步。
 
-每行一张图片及一段对话，图片路径相对于 `--image-root`，不在文本中写 `<image>`：
+### 9B. 自己训练视觉权重
 
-```json
-{"image":"scene/0001.jpg","messages":[{"role":"user","content":"描述这张图片。"},{"role":"assistant","content":"一只黑白相间的猫坐在窗边。"}]}
+**跳过 9A 的权重下载和配置选择。** 先执行第 10 步的数据下载、转换和图文对预训练；第 10.3 步训练验收并导出后再选择 `vision-active.json`。
+
+## 10. 下载视觉数据，路线 B 再进行图文对预训练
+
+### 10.1 数据来源与下载
+
+当前推荐 [MiniMind-V 数据仓库](https://huggingface.co/datasets/jingyaogong/minimind-v_dataset/tree/1e279a8b665cb10383451a6af6fd62b9f35bdd79)，固定版本 `1e279a8b665cb10383451a6af6fd62b9f35bdd79`，核对日期 2026-09-28。
+
+| 文件 | 下载大小（十进制） | 本项目用途 |
+| --- | ---: | --- |
+| `pretrain_i2t.parquet` | 4.33 GB | 路线 B 的图片—描述对比预训练；两条路线的 projector 对齐 |
+| `sft_i2t.parquet` | 4.93 GB | 图文指令 SFT，排除纯文本占位样本 |
+
+数据卡说明 caption 约 127 万条、约 64 万张唯一图片，SFT 约 290 万条，后者混有 caption 与纯文本数据。我们会按图片字节去重图像文件，并且对比预训练仅保留每张图片首次遇到的有效描述，避免同一图片的多条描述在 batch 中被错误当作负例；不保证中英文均衡。转换后的确切数量看报告，不能直接沿用数据卡数字。
+
+图片以 `image_bytes` 内嵌在 Parquet 中，问答在 `conversations` 列，**无需另找图片压缩包**。网页自动 Viewer 可能只展示几张测试图，不代表训练文件只有几条。上游主要来自 [ALLaVA-4V](https://huggingface.co/datasets/FreedomIntelligence/ALLaVA-4V)，包含生成式标注；该上游数据卡标注 CC-BY-NC-4.0（非商业），不能因 MiniMind-V 聚合仓库标注 Apache-2.0 就当成全部可商用。还需核对原始图片和其他混入来源条款。
+
+```bash
+uv run --locked --extra vision python scripts/download_visual_data.py \
+  --stage both --output data/downloads/minimind-vision-v1 --list
+
+uv run --locked --extra vision python scripts/download_visual_data.py \
+  --stage both --output data/downloads/minimind-vision-v1
 ```
 
-多轮数据仍为 user/assistant 交替。第一版只支持一段会话对应一张图片，该图片作用于整个对话；不支持多图、视频或动态分辨率。数据处理会自动把视觉位置插在首个 user 标记之后，并同步调整 labels。
+合计约 9.26 GB，仅下载这两份文件，固定版本并校验大小和 SHA256。中断后重跑同一命令。下载计划不同则使用新目录。还需给解包图片、JSONL、索引和训练 checkpoint 留空间，建议先预留至少 50 GB 数据空间，checkpoint 另计；几十万图片也需要足够 inode。脚本已用合成 Parquet 测试，但未在本机完整下载和清洗这两份真实文件。
 
-分别准备：
+### 10.2 转换格式并提取图片
 
-- `data/raw/vision-align.jsonl`：图片描述，训练视觉与文本的连接层。
-- `data/raw/vision-sft.jsonl`：图片问答/多轮指令，训练视觉适配器。
-- 图片根目录 `data/images/`。
+```bash
+uv run --locked --extra vision python scripts/convert_visual_data.py \
+  --pretrain data/downloads/minimind-vision-v1/pretrain_i2t.parquet \
+  --sft data/downloads/minimind-vision-v1/sft_i2t.parquet \
+  --output data/raw/vision-v1
+```
+
+输出目录必须尚不存在，得到：
+
+- `vision-align.jsonl`：图片描述会话，用于投影层对齐。
+- `vision-sft.jsonl`：图片指令会话，用于视觉 SFT。
+- `captions.jsonl`：每张图片一份描述，用于路线 B。
+- `images/`：以内容 SHA256 命名的原始图片文件；扩展名 `.image`，Pillow 根据实际文件内容解码。
+- `import-report.json`：来源/输出哈希、保留数、过滤原因、转换器版本指纹。
+
+脚本流式读取 Parquet、保留原始图片字节，移除首个 user 问题中的 `<image>` 标记。过滤多图、工具调用、无图、8×8 等极小占位图、不合法对话，按普通回答策略处理 reasoning 字段。先用 `--limit 1000` 和新的 pilot 目录可以检查转换流程，但它只是文件前缀，不是代表性训练样本；正式训练不要误用 pilot。
+
+本项目支持一段会话一张图片。转换后的格式类似：
+
+```json
+{"image":"ab/完整哈希.image","messages":[{"role":"user","content":"描述这张图片。"},{"role":"assistant","content":"一只猫坐在窗边。"}]}
+```
+
+不要在转换后的文本中手动添加图像特殊 token；VLM 预处理会自动插入 64 个视觉位置，并屏蔽这些位置的语言监督。
+
+### 10.3 仅路线 B：从随机初始化训练 SigLIP 式编码器
+
+**路线 A 跳过这一节。** 使用 `pretrain_i2t.parquet` 提取的 caption 学图片—描述匹配，不使用任意 VQA 答案替代完整图片描述。
+
+先准备对比数据，沿用已有 tokenizer；不重新训练或修改它：
+
+```bash
+uv run --locked --extra vision python -m moe_llm.siglip_training prepare \
+  --input data/raw/vision-v1/captions.jsonl \
+  --image-root data/raw/vision-v1/images --output data/siglip-pairs-v1 \
+  --tokenizer data/tokenizer-v1.json --text-length 128 --val-ratio 0.05 --seed 42
+```
+
+图片按内容哈希划分 train/val，规则与后面的 VLM 划分相同；必须保持 seed=42、val_ratio=0.05，并保留图片原始字节。描述在 128-token 上限内保留 BOS/EOS，超长部分截断，统计在 manifest；这与 VLM 超长整段跳过的策略不同。近重复图、重编码图还需额外清理。
+
+模型配置 `configs/siglip-scratch.json`：视觉 6 层、hidden384、6 头、patch16；文本对比编码器 4 层；对比 embedding256。它是独立于 264M LLM 的小模型。
+
+单卡短跑（默认每卡 batch16）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --locked --extra vision python -m moe_llm.siglip_training train \
+  --config configs/siglip-scratch.json --data data/siglip-pairs-v1 \
+  --tokenizer data/tokenizer-v1.json --output runs/siglip-pilot-1gpu --stop-after 10
+```
+
+八卡短跑：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
+  --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.siglip_training train \
+  --config configs/siglip-scratch.json --data data/siglip-pairs-v1 \
+  --tokenizer data/tokenizer-v1.json --output runs/siglip-pilot-8gpu --stop-after 10
+```
+
+此训练器与 `moe-lab train` 分开，**不接收 `--eval-max-batches`**。配置的 `eval_samples=256` 限制验证候选集，短跑末尾也最多评估 256 个图文对，打印 `validation_start`，不跑全部验证集。若需减少短跑验证，先复制配置并修改 eval_samples，不改正在运行的文件。
+
+八卡默认全局 batch 为 128。每个图像与所有卡的文本特征做 sigmoid 正/负配对，使用带梯度的 all-gather。当前不实现梯度累积；普通梯度累积不会扩大同一步对比负样本池。单卡和八卡负样本数不同，训练 loss 不可直接横比。数据采样丢弃不足全局 batch 的尾部，保证不同卡形状一致，不通过重复图片补齐。
+
+先检查两侧编码器梯度、loss 有限、保存恢复正常，再启动新目录的正式实验：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
+  --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.siglip_training train \
+  --config configs/siglip-scratch.json --data data/siglip-pairs-v1 \
+  --tokenizer data/tokenizer-v1.json --output runs/siglip-scratch-001
+```
+
+默认 max_steps=10000，八卡 batch16 时处理约 128 万图文对（包含跨 epoch 重复）；这是实验起点，不是官方级预训练预算。每 500 步及结束时用固定最多 256 个留出图文对验证，每 1000 步及结束时保存。学习率/总步数需在正式运行前确定。日志记录全局 batch、训练图片数、耗时、分配 GPU 秒、峰值显存；run/checkpoint 保存数据、代码、tokenizer、配置和随机状态，无外部模型 API 调用。
+
+精确恢复示例，要求第 1000 步文件存在，保持代码、配置、环境、数据和 GPU 数不变：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
+  --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.siglip_training train \
+  --config configs/siglip-scratch.json --data data/siglip-pairs-v1 \
+  --tokenizer data/tokenizer-v1.json \
+  --resume runs/siglip-scratch-001/step-0001000.pt --output runs/siglip-scratch-001-resumed
+```
+
+**验收视觉预训练，不只看 loss：** 固定候选集上的 `image_to_text_r1` / `text_to_image_r1` 是图到文/文到图检索 Recall@1。256 个候选随机基线为 1/256；与早期 checkpoint 在同一集合上比较，并人工检查检索结果。没有统一合格阈值，不能把小集合 R@1 当作 VQA 能力。较大的评测候选集计算 N×N 相似度矩阵，不要未经显存评估直接覆盖整个数据集。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --locked --extra vision python -m moe_llm.siglip_training evaluate \
+  --checkpoint runs/siglip-scratch-001/step-0010000.pt \
+  --data data/siglip-pairs-v1 --device cuda --batch-size 16 --max-samples 256
+```
+
+检查学习趋势后导出选中的视觉 backbone（这里示例用最终步，若从恢复目录完成需修改路径）：
+
+```bash
+uv run --locked --extra vision python -m moe_llm.siglip_training export \
+  --checkpoint runs/siglip-scratch-001/step-0010000.pt \
+  --output models/siglip-scratch-v1
+
+uv run --locked python - <<'PY'
+from pathlib import Path
+with Path('configs/vision-active.json').open('x') as f:
+    f.write(Path('configs/vision-siglip-scratch.json').read_text())
+PY
+```
+
+导出包含网络配置、预处理配置、safetensors 权重、来源/训练 checkpoint 指纹。导出成功只说明格式可用，不表示效果合格。不要导出十步 pilot 后当作正式视觉模型。路线 B 可能明显弱于路线 A；可以作为对照实验，但不要承诺同样成本得到同等效果。两条路线的视觉 hidden size 不同，必须各自重新训练 projector/视觉 LoRA，不能直接互换适配器 checkpoint。
+
+### 10.4 两条路线汇合：准备 VLM 对齐与 SFT 数据
+
+此时 `configs/vision-active.json` 必须指向你选中的视觉权重目录；路线 B 要先完成导出。只选择一次，开始视觉训练后不要原地修改。切换路线应创建新的配置和新的 runs 目录。
 
 ```bash
 uv run --locked --extra vision moe-lab vision-prepare \
-  --input data/raw/vision-align.jsonl --image-root data/images \
+  --input data/raw/vision-v1/vision-align.jsonl --image-root data/raw/vision-v1/images \
   --output data/vision-align-v1 --tokenizer data/tokenizer-v1.json \
-  --vision-config configs/vision-siglip.json --max-seq-len 512 --val-ratio 0.05 --seed 42
+  --vision-config configs/vision-active.json --max-seq-len 512 --val-ratio 0.05 --seed 42
 
 uv run --locked --extra vision moe-lab vision-prepare \
-  --input data/raw/vision-sft.jsonl --image-root data/images \
+  --input data/raw/vision-v1/vision-sft.jsonl --image-root data/raw/vision-v1/images \
   --output data/vision-sft-v1 --tokenizer data/tokenizer-v1.json \
-  --vision-config configs/vision-siglip.json --max-seq-len 512 --val-ratio 0.05 --seed 42
+  --vision-config configs/vision-active.json --max-seq-len 512 --val-ratio 0.05 --seed 42
 ```
 
-**同一张图片的所有问题按图片文件内容哈希分到同一侧。** 两个阶段保持同一 split seed 和比例，可让相同图片文件在两个阶段都处于同一侧。重新编码、裁剪或近重复图片仍需额外去重。
+同图所有问题按原始图片内容哈希分到同一侧；保持与对比预训练相同的 seed 和比例。这些文件在不同阶段有图片重叠，但相同图片不会从某阶段训练侧跑到另一个阶段验证侧。这里 512 上限包含 64 个视觉 tokens 和全部对话，超长整段跳过；caption 可能较长，要先看 manifest 的 `overlong` 和剩余样本数。如果大多数被过滤，用新目录准备更长窗口并做显存短跑。
 
-512 上限包含视觉 tokens、角色标记、问题和回答；超长对话会被跳过。检查 manifest 的 `overlong`，不要只按文字长度估算。图片文件不可在准备后悄悄替换；训练加载时会检查指纹。搬迁图片目录后可在训练/评测时通过 `--image-root` 指向相同内容的新位置。
+图片不可准备后悄悄替换；搬迁图片目录时通过 `--image-root` 指向相同内容的新位置。文本基座仍必须通过第 8 步验收，才能开始后面的正式 VLM 训练。
 
 ## 11. 视觉对齐：只训练投影层
 
@@ -403,7 +545,7 @@ uv run --locked --extra vision moe-lab vision-prepare \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli vision-train \
   --base-checkpoint runs/text-sft-001/step-0000500.pt \
-  --vision-config configs/vision-siglip.json --train-config configs/train-vision-align.json \
+  --vision-config configs/vision-active.json --train-config configs/train-vision-align.json \
   --data data/vision-align-v1 --tokenizer data/tokenizer-v1.json \
   --output runs/vision-align-001
 ```
@@ -420,7 +562,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked --extra vision torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli vision-train \
   --base-checkpoint runs/text-sft-001/step-0000500.pt \
-  --vision-config configs/vision-siglip.json --train-config configs/train-vision-sft.json \
+  --vision-config configs/vision-active.json --train-config configs/train-vision-sft.json \
   --data data/vision-sft-v1 --tokenizer data/tokenizer-v1.json \
   --init-from runs/vision-align-001/step-0001000.pt \
   --output runs/vision-sft-001
@@ -449,13 +591,24 @@ uv run --locked --extra vision moe-lab vision-evaluate \
 
 `val_loss` 是正常图片条件下的回答 loss；`zero_image_loss` 是将归一化图片张量置零的对照。如果差异很小，值得排查模型是否忽略图片；它本身不是视觉理解成功或失败的充分证明。还应在留出图片上人工检查答案，并将同一问题配不同图片，观察答案是否随图片内容合理变化。
 
-有图推理：
+有图推理，从实际准备好的视觉验证集取第一张图（不再使用不存在的示例图片路径）：
 
 ```bash
+VLM_TEST_IMAGE=$(uv run --locked python - <<'PYIMAGE'
+import json
+from pathlib import Path
+root = Path('data/vision-sft-v1')
+manifest = json.loads((root / 'manifest.json').read_text())
+with (root / 'val.jsonl').open() as f:
+    row = json.loads(next(f))
+print(Path(manifest['image_root']) / row['image'])
+PYIMAGE
+)
+
 uv run --locked --extra vision moe-lab vision-generate \
   --base-checkpoint runs/text-sft-001/step-0000500.pt \
   --checkpoint runs/vision-sft-001/step-0001000.pt \
-  --tokenizer data/tokenizer-v1.json --image data/images/scene/0001.jpg \
+  --tokenizer data/tokenizer-v1.json --image "$VLM_TEST_IMAGE" \
   --prompt '描述这张图片。' --temperature 0 --max-new-tokens 128
 ```
 

@@ -1,4 +1,4 @@
-"""Frozen SigLIP + projector + explicitly enabled visual LoRA.
+"""Native frozen SigLIP + projector + explicitly enabled visual LoRA.
 
 The fixture backend is a random frozen patch convolution, solely for offline
 engineering tests. It is not a pretrained or useful vision encoder.
@@ -70,15 +70,17 @@ class ImageProcessor:
         self.config = config
         self.backend = None
         if config.encoder_type == "siglip":
-            from transformers import SiglipImageProcessor
-            self.backend = SiglipImageProcessor.from_pretrained(config.encoder_path, local_files_only=True)
+            from .siglip import SiglipConfig, NativeImageProcessor
+            root = Path(config.encoder_path)
+            c = SiglipConfig.load(root / 'config.json')
+            self.backend = NativeImageProcessor(c.image_size, json.loads((root / 'preprocessor_config.json').read_text()))
 
     def __call__(self, path):
         from PIL import Image, ImageOps
         with Image.open(path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
             if self.backend is not None:
-                return self.backend(images=image, return_tensors="pt")["pixel_values"][0]
+                return self.backend(image)
             import numpy as np
             size = self.config.fixture_image_size
             image = image.resize((size, size), Image.Resampling.BICUBIC)
@@ -91,10 +93,8 @@ class FrozenVisionEncoder(nn.Module):
         super().__init__()
         self.config = config
         if config.encoder_type == "siglip":
-            from transformers import SiglipVisionModel
-            self.encoder = SiglipVisionModel.from_pretrained(
-                config.encoder_path, local_files_only=True, use_safetensors=True,
-            )
+            from .siglip import NativeSiglipVision
+            self.encoder = NativeSiglipVision.from_local(config.encoder_path)
             self.hidden_size = self.encoder.config.hidden_size
             self.image_size = self.encoder.config.image_size
             patch_size = self.encoder.config.patch_size
@@ -120,7 +120,7 @@ class FrozenVisionEncoder(nn.Module):
         if pixel_values.ndim != 4 or pixel_values.shape[1:] != (3, self.image_size, self.image_size):
             raise ValueError("pixel_values shape differs from the encoder image size")
         if self.config.encoder_type == "siglip":
-            features = self.encoder(pixel_values=pixel_values).last_hidden_state
+            features = self.encoder(pixel_values=pixel_values)
             grid = math.isqrt(features.shape[1])
             if grid * grid != features.shape[1]:
                 raise ValueError("expected a square SigLIP patch grid without CLS token")

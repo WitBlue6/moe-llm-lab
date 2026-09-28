@@ -55,7 +55,7 @@ def register(commands):
 def dispatch(args):
     try:
         import PIL
-        import transformers
+        import safetensors
     except ImportError as error:
         raise RuntimeError("vision commands require: uv sync --locked --extra vision") from error
     import torch

@@ -171,5 +171,9 @@ def test_local_siglip_loader_processor_and_patch_pooling(tmp_path):
     model = FrozenVisionEncoder(config)
     features = model(pixels.unsqueeze(0))
     assert features.shape == (1, 4, 16) and not features.requires_grad
-    for a, b in zip(encoder.parameters(), model.encoder.parameters()):
-        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    reference = encoder.vision_model.state_dict()
+    for name, value in model.encoder.state_dict().items():
+        torch.testing.assert_close(reference[name], value, atol=0, rtol=0)
+    expected = encoder(pixels.unsqueeze(0)).last_hidden_state.transpose(1, 2).reshape(1, 16, 4, 4)
+    expected = torch.nn.functional.adaptive_avg_pool2d(expected, 2).flatten(2).transpose(1, 2)
+    torch.testing.assert_close(features, expected, atol=2e-6, rtol=2e-5)

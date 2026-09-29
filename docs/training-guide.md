@@ -744,3 +744,28 @@ Epoch 1/2 [###---------] 250/1000 train=3.2100 val=3.4800@200 train ETA=900s
 重定向到文件或普通管道时自动使用纯 JSON 行，避免控制字符污染日志。`MOE_LAB_PROGRESS=0` 可手动关闭进度条；支持终端控制字符的环境可用 `MOE_LAB_PROGRESS=1` 强制开启（经 `tee` 时文件也会记录控制字符）。无需新增 CLI 参数。
 
 本次代码更新会改变严格恢复的代码指纹。正在运行或需要精确 resume 的旧实验继续使用原代码；完成后再更新，新实验使用新显示。不要为进度条绕过恢复校验。
+
+## 绘制训练损失曲线
+
+读取已有 `metrics.jsonl`，无需加载 checkpoint 或重新训练。服务器无需图形桌面，支持 PNG/PDF/SVG。`train_loss`、`aux_loss`、`val_loss` 分成三个面板，避免不同数值范围挤在同一坐标轴上。
+
+```bash
+uv run --locked --extra plot python scripts/plot_training.py \
+  --runs runs/text-pretrain-001 \
+  --output reports/text-pretrain-001-loss.png
+```
+
+`--runs` 支持 run 目录或 JSONL 文件，也支持多个目录做对比。以下同时保留原始训练/辅助损失浅色线，叠加最近 50 次更新的均值；验证值不平滑、不补齐到每一步：
+
+```bash
+uv run --locked --extra plot python scripts/plot_training.py \
+  --runs runs/text-pretrain-001 runs/text-pretrain-001-resumed \
+  --labels original resumed --smooth-window 50 \
+  --output reports/text-pretrain-comparison.png
+```
+
+恢复目录保留全局 step，作为独立曲线显示，不自动连接或合并多个 run。比较不同实验时保持数据、精度与验证范围一致；文本预训练、SFT 和 SigLIP 的 loss 不能当作同一任务直接比较。SigLIP 没有 aux_loss，该面板标记未记录/不适用。
+
+训练期间也可执行，会跳过尚未写完的最后一行；图表是运行脚本时的快照，不自动刷新。已有报告不覆盖，再次绘图请换输出文件名。缺少验证记录时显示未记录，绝不使用 train_loss 代替 val_loss。
+
+若当前训练仍在进行，建议等结束再同步依赖与运行 uv 绘图，以免 uv 同步环境影响活动实验；只需要已有日志，不必为了画图重启训练。

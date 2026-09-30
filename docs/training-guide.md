@@ -769,3 +769,36 @@ uv run --locked --extra plot python scripts/plot_training.py \
 训练期间也可执行，会跳过尚未写完的最后一行；图表是运行脚本时的快照，不自动刷新。已有报告不覆盖，再次绘图请换输出文件名。缺少验证记录时显示未记录，绝不使用 train_loss 代替 val_loss。
 
 若当前训练仍在进行，建议等结束再同步依赖与运行 uv 绘图，以免 uv 同步环境影响活动实验；只需要已有日志，不必为了画图重启训练。
+
+## 自动保存最佳 checkpoint（val_loss 最低）
+
+文本预训练/SFT、视觉对齐/SFT、SigLIP 训练均自动启用，无需新增参数。每次实际验证后，只要有限的 `val_loss` 严格下降，就保存对应 `step-XXXXXXX.pt`，即使该步没有到 `save_every`；相同 loss 保留较早版本。原来的定期保存与末尾保存继续生效，同一步只保存一次。
+
+run 目录新增 `best.json`，包含 `step`、`val_loss`、`checkpoint`（绝对路径）与验证范围。checkpoint 内保存历史最佳信息，`summary.json` 也包含 `best`。不额外复制一份大型 `best.pt`；历史改善步骤文件保留，注意磁盘空间。
+
+训练后读取最佳权重并生成文本：
+
+```bash
+BEST=$(uv run --locked python - runs/epoch1-20260929-pretrain <<'PY'
+import json, sys
+from pathlib import Path
+best = json.loads((Path(sys.argv[1]) / 'best.json').read_text())
+p = Path(best['checkpoint'])
+assert p.is_file(), p
+print(p)
+PY
+)
+uv run --locked moe-lab generate --checkpoint "$BEST" \
+  --tokenizer data/tokenizer-v1.json --prompt '机器学习是一种' \
+  --max-new-tokens 128 --temperature 0.8
+```
+
+将目录换成实际 run。文本 SFT 后的生成加 `--chat`；视觉 best 是 adapter，应传给 `vision-generate --checkpoint` 并保持原 `--base-checkpoint`；SigLIP best 可用于 evaluate/export。选择中间 best 不要求训练已完成整轮，所以不要用要求整轮完成的 `final_ckpt` 函数读取它。
+
+精确 `--resume` 继承所加载 checkpoint 保存时的历史最佳值；如果后续没有改善，新目录的 `best.json` 仍指向原目录中的最佳文件，必须保留原文件。恢复旧的中间 checkpoint 不会读取原目录中未来步骤的最佳结果。路径为绝对路径，迁移机器或目录时需保留对应路径，当前不自动迁移历史最佳引用。
+
+恢复要求验证范围保持一致，包括文本/VLM 的 `--eval-max-batches`；不能改变验证子集后沿用旧最低 loss。`--init-from` 只继承模型权重，最佳记录重新开始。没有历史 best 字段的兼容 checkpoint 不追溯旧日志，但仍需通过原有严格代码/配置恢复校验。
+
+使用验证上限时，best 指固定验证子集上的最低 loss，不代表全量验证或问答效果最好。独立全量评测不会自动改写训练 best。建议对 best 与最终 checkpoint 做同条件生成对比。
+
+本次训练器代码更新会改变代码指纹。进行中的旧实验请用原代码完成或续训；不要为了启用 best 绕过严格 resume 校验，新版用于新实验。

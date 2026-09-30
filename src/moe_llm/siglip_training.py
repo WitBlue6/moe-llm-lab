@@ -6,6 +6,7 @@ ranks' captions as negatives. No gradient accumulation: it would not enlarge
 the contrastive negative pool. Eval uses a fixed, explicitly sized candidate set.
 """
 from .progress import TrainingProgress, log_json
+from .best_checkpoint import BestCheckpoint
 
 import argparse
 from dataclasses import asdict
@@ -213,6 +214,8 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
             raise ValueError('exact resume requires same configuration, code, data, tokenizer, device and world size')
         raw.load_state_dict(state['model']); optimizer.load_state_dict(state['optimizer'])
         step, epoch, cursor, trained_images = (state[k] for k in ('step', 'epoch', 'cursor', 'trained_images'))
+    best = BestCheckpoint(state if resume else None, {'eval_samples': c['eval_samples'],
+        'precision': 'fp32', 'batch_size': c['batch_size'], 'world_size': world})
     end = stop_after or c['max_steps']
     if end <= step:
         raise ValueError('checkpoint already reached requested stopping step')
@@ -224,6 +227,7 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
         raise FileExistsError(f'use a NEW output directory: {root}')
     if rank == 0:
         root.mkdir(parents=True)
+        best.publish(root)
         log_json({'event': 'training_budget', 'epochs': c.get('epochs'),
                           'max_steps': c['max_steps'],
                           'steps_per_epoch': len(train_data) // (world * c['batch_size'])})
@@ -287,7 +291,8 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
                     with (root / 'metrics.jsonl').open('a') as f:
                         f.write(json.dumps(metrics) + '\n')
                     log_json(metrics)
-                if step % c['save_every'] == 0 or step == end:
+                improved = best.consider(metrics, root, rank, world) if step % c['eval_every'] == 0 or step == end else False
+                if improved or step % c['save_every'] == 0 or step == end:
                     progress.phase("save")
                     local_rng = rng_state(device)
                     states = [None] * world
@@ -299,15 +304,17 @@ def _train(c, data, output, tokenizer_path, stop_after, resume, image_root, rank
                         target = root / f'step-{step:07d}.pt'
                         payload = {'format': 'moe-lab-siglip-training-v1', 'config': c, 'manifest': manifest,
                             'provenance': provenance, 'model': raw.state_dict(), 'optimizer': optimizer.state_dict(),
-                            'step': step, 'epoch': epoch, 'cursor': cursor, 'trained_images': trained_images, 'rng': states}
+                            'step': step, 'epoch': epoch, 'cursor': cursor, 'trained_images': trained_images, 'rng': states, 'best': best.best}
                         temporary = target.with_suffix('.tmp')
                         torch.save(payload, temporary); temporary.rename(target)
+                        best.publish(root)
                     if world > 1:
                         dist.barrier()
                 if step == end:
                     break
             if step < end:
                 epoch += 1; cursor = 0
+    metrics['best'] = best.best
     if rank == 0:
         (root / 'summary.json').write_text(json.dumps(metrics, indent=2))
     return metrics

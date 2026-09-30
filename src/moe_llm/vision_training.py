@@ -1,6 +1,7 @@
 """Projector alignment and visual-LoRA SFT with immutable text/vision backbones."""
 from dataclasses import asdict, dataclass
 from .progress import TrainingProgress, log_json
+from .best_checkpoint import BestCheckpoint
 
 import json
 import math
@@ -124,7 +125,7 @@ def evaluate_visual(model, dataset, batch_size, device, precision, rank=0, world
 
 
 def save_visual(root, model, config, identity, provenance, optimizer, scaler, step, stream,
-                trained_tokens, device, rank, world):
+                trained_tokens, device, rank, world, best=None):
     states = [None] * world
     local = rng_state(device)
     if world > 1:
@@ -142,7 +143,7 @@ def save_visual(root, model, config, identity, provenance, optimizer, scaler, st
                         "train_config": asdict(config), **identity, "provenance": provenance,
                         "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                         "step": step, "epoch": stream.epoch, "cursor": stream.cursor,
-                        "trained_tokens": trained_tokens, "rng_states": states, "world_size": world}, handle)
+                        "trained_tokens": trained_tokens, "rng_states": states, "world_size": world, "best": best}, handle)
         temporary.rename(target)
     if world > 1:
         dist.barrier()
@@ -250,6 +251,10 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
                   find_unused_parameters=True, broadcast_buffers=False) if world > 1 else model
     if resume:
         restore_rng(state["rng_states"][rank], device)
+    best = BestCheckpoint(state if resume else None, {"eval_max_batches_per_rank": eval_max_batches,
+        "batch_size": c.batch_size, "world_size": world, "precision": c.precision})
+    if rank == 0:
+        best.publish(root)
     del state
     model.train()
     wall_start, tokens_at_start = time.perf_counter(), trained_tokens
@@ -321,15 +326,19 @@ def _train_visual(base_checkpoint, vc, c, data_path, tokenizer_path, output, ini
                 with (root / "metrics.jsonl").open("a") as handle:
                     handle.write(json.dumps(metrics) + "\n")
                 log_json({k: v for k, v in metrics.items() if k != "expert_usage"})
-            if (step + 1) % c.save_every == 0 or step + 1 == end:
+            improved = best.consider(metrics, root, rank, world) if (step + 1) % c.eval_every == 0 or step + 1 == end else False
+            if improved or (step + 1) % c.save_every == 0 or step + 1 == end:
                 progress.phase("save")
                 save_visual(root, model, c, identity, provenance, optimizer, scaler, step + 1,
-                            stream, trained_tokens, device, rank, world)
+                            stream, trained_tokens, device, rank, world, best.best)
+                if rank == 0:
+                    best.publish(root)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - wall_start
     metrics.update(elapsed_seconds_this_run=elapsed, allocated_gpu_seconds_this_run=elapsed * world if device.type == "cuda" else 0.,
                    supervised_tokens_per_second_this_run=(trained_tokens - tokens_at_start) / max(elapsed, 1e-9))
+    metrics["best"] = best.best
     if rank == 0:
         (root / "summary.json").write_text(json.dumps(metrics, indent=2))
     return metrics

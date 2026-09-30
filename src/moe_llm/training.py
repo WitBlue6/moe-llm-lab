@@ -6,6 +6,7 @@ with dynamically unused experts takes priority over communication optimization.
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from .progress import TrainingProgress, log_json
+from .best_checkpoint import BestCheckpoint
 
 import json
 import math
@@ -197,7 +198,7 @@ def git_revision():
 
 
 def write_checkpoint(root, model, optimizer, scaler, step, stream, config, provenance,
-                     device, rank, world, trained_tokens):
+                     device, rank, world, trained_tokens, best=None):
     local_rng = rng_state(device)
     states = [None] * world
     if world > 1:
@@ -215,7 +216,7 @@ def write_checkpoint(root, model, optimizer, scaler, step, stream, config, prove
                         "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                         "step": step, "epoch": stream.epoch, "cursor": stream.cursor,
                         "rng_states": states, "world_size": world, "provenance": provenance,
-                        "trained_tokens": trained_tokens}, handle)
+                        "trained_tokens": trained_tokens, "best": best}, handle)
         temporary.rename(path)
     if world > 1:
         dist.barrier()
@@ -354,6 +355,10 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
                   find_unused_parameters=True, broadcast_buffers=False) if world > 1 else model
     if resume:
         restore_rng(state["rng_states"][rank], device)
+    best = BestCheckpoint(state if resume else None, {"eval_max_batches_per_rank": eval_max_batches,
+        "batch_size": config.batch_size, "world_size": world, "precision": config.precision})
+    if rank == 0:
+        best.publish(root)
     del state
     model.train()
     tokens_at_start = trained_tokens
@@ -428,16 +433,20 @@ def _train(model_config, config, data_path, tokenizer_path, output, init_from, r
                 with (root / "metrics.jsonl").open("a") as handle:
                     handle.write(json.dumps(last_metrics) + "\n")
                 log_json({k: v for k, v in last_metrics.items() if k != "expert_usage"})
-            if (step + 1) % config.save_every == 0 or step + 1 == end:
+            improved = best.consider(last_metrics, root, rank, world) if (step + 1) % config.eval_every == 0 or step + 1 == end else False
+            if improved or (step + 1) % config.save_every == 0 or step + 1 == end:
                 progress.phase("save")
                 write_checkpoint(root, model, optimizer, scaler, step + 1, stream, config, provenance,
-                                 device, rank, world, trained_tokens)
+                                 device, rank, world, trained_tokens, best.best)
+                if rank == 0:
+                    best.publish(root)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - wall_start
     last_metrics.update({"elapsed_seconds_this_run": elapsed,
                          "allocated_gpu_seconds_this_run": elapsed * world if device.type == "cuda" else 0,
                          "supervised_tokens_per_second_this_run": (trained_tokens - tokens_at_start) / max(elapsed, 1e-9)})
+    last_metrics["best"] = best.best
     if rank == 0:
         (root / "summary.json").write_text(json.dumps(last_metrics, indent=2))
     return last_metrics

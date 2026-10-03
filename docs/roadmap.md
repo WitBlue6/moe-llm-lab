@@ -20,20 +20,19 @@
 
 基础模型稳定后，用同一领域/任务数据比较 full SFT 与 LoRA。复用已实现的注意力低秩层，另加独立文本 LoRA 训练入口与权重合并，再决定是否适配专家投影。视觉 LoRA 为保留原文本路径不做合并。记录可训练参数、显存、耗时及遗忘情况。
 
-## 第三阶段：DPO（明确计划）
+## 第三阶段：DPO（已实现基础链路）
 
-从同一个 SFT checkpoint 出发，构建或清理 chosen/rejected 偏好对；实现 completion-only sequence log-prob、冻结 reference、DPO loss 与偏好准确率。核验 prompt mask、beta、截断处理，不能只凭训练 loss 判断质量。
+已实现 completion-only 序列 log-prob 求和、冻结 SFT reference、DPO loss、偏好准确率、best 与恢复。下一步使用经过检查的真实偏好数据进行固定问题集验证，不能只凭训练 loss 判断质量。操作见 [RL 训练指南](rl-training-guide.md)。
 
-## 第四阶段：奖励模型 + PPO（明确计划）
+## 第四阶段：奖励模型 + PPO（已实现基础链路）
 
-学习 reward model 的 pairwise ranking loss；在 MoE backbone 上增加 reward/value head。
-随后实现 rollout、旧策略 log-prob、reference KL 奖励、value prediction、GAE、PPO clipped policy loss、value loss、entropy、多个优化 epoch、EOS/截断/response mask 和策略版本一致性。
+已实现独立奖励主干＋标量 head 的 pairwise ranking；PPO 采用共享 actor 主干＋value head。支持可核验奖励/冻结奖励模型、rollout、固定旧概率、reference KL 奖励、GAE、policy/value clipping、entropy、多次更新与有限回答终止。当前每卡完整副本、顺序 rollout，显式梯度归约；不宣称正式模型的训练速度或质量已验收。
 
 首先用可验证任务验证 PPO 数学与数据流，再接入奖励模型。保存独立任务正确率与奖励，区分奖励上升与真实能力改善。actor、critic、reference 和 reward model 的部署方式需依据服务器显存实测，不能按 8×24GB 自动合并显存估算。
 
-## 第五阶段：可选 GRPO 与比较
+## 第五阶段：GRPO（已实现）与算法比较（待实验）
 
-复用 rollout 与奖励接口，再加入 GRPO，理解其与 PPO 的 critic/advantage 差异。检查组内奖励方差，比较相同采样预算的 SFT、DPO、PPO 与 GRPO；不预设任何算法一定更好。
+GRPO 已复用 rollout 与奖励接口，实现组内标准化优势、clipped objective 和 reference KL，无 critic。下一步检查组内奖励方差，在匹配任务与采样/更新预算下比较 SFT、DPO、PPO 与 GRPO；不预设任何算法一定更好。
 
 ## 训练预算与学习方式
 

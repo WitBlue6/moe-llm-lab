@@ -59,6 +59,8 @@ def main(argv=None):
             sub.add_argument("--batch-size", type=int, default=1)
     from .vision_cli import register
     register(commands)
+    from .posttrain_cli import register as register_posttrain
+    register_posttrain(commands)
     doctor = commands.add_parser("doctor", help="read-only Python/CUDA/GPU diagnostics")
     doctor.add_argument("--output", help="save diagnostics to a new JSON file")
     configure = commands.add_parser("configure", help="create a model config with the actual tokenizer vocabulary")
@@ -66,6 +68,9 @@ def main(argv=None):
     configure.add_argument("--tokenizer", required=True)
     configure.add_argument("--output", required=True)
     args = parser.parse_args(argv)
+    if args.command.startswith("post-"):
+        from .posttrain_cli import dispatch
+        return dispatch(args)
     if args.command.startswith("vision-"):
         from .vision_cli import dispatch
         return dispatch(args)

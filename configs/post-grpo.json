@@ -1,0 +1,9 @@
+{
+  "algorithm": "grpo", "max_steps": 100, "batch_size": 1,
+  "grad_accum_steps": 1, "learning_rate": 0.000001,
+  "warmup_steps": 10, "update_epochs": 2, "group_size": 4,
+  "reward": "numeric", "kl_coef": 0.02, "clip_range": 0.2,
+  "max_new_tokens": 64, "temperature": 1.0,
+  "eval_every": 10, "save_every": 10, "eval_max_records": 16,
+  "device": "cuda", "precision": "bf16", "seed": 42
+}

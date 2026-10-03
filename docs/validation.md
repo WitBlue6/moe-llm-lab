@@ -57,3 +57,20 @@ uv run --locked --extra vision python scripts/smoke.py --output <新的测试目
 - `uv run --locked --extra vision pytest -q -p no:cacheprovider`：47 passed。覆盖随机小型参考编码器数值一致性、sigmoid 损失数学、双卡/Gloo 全局梯度等价、恢复一致、导出接入和既有文本/VLM 回归。
 - 训练指南 35 个 Bash 块通过 `bash -n`，36 条训练/数据命令通过 argparse 解析检查，未执行正式训练或完整数据下载。
 - 未完整下载官方视觉权重或约 9.26 GB 的视觉语料；未实测新编码器的 CUDA/NCCL、8×3090 显存吞吐、真实检索/VQA 效果。随机 fixture 测试不代表预训练视觉能力。
+
+## 2026-10-03：文本 SFT 后训练与用户曲线展示
+
+- README 加入运行者提供的文本预训练、文本 SFT、视觉对齐、视觉 SFT 四张图；未审计完整原始 run 元数据，不将 loss 下降直接称为能力提升。
+- 新增偏好对/在线 prompt 数据准备、原生 DPO、独立偏好奖励模型、共享 actor 主干 value head 的 PPO、无 critic 的 GRPO，以及显式梯度归约的数据并行、恢复与独立评测。
+- `uv run --locked --offline --extra vision --extra plot pytest -q`：**69 passed in 47.18s**。包含 DPO 梯度方向、GAE/clip/group 数学、completion mask、采样/概率重放、四条训练路线的恢复、奖励模型接入、epoch 尾批、双进程全局 DPO 梯度等价和 DPO/PPO/GRPO 双进程恢复一致性。
+- `scripts/smoke.py --posttrain` 实际命令行串联微型预训练、SFT、post-prepare、四条训练路线、post-evaluate 和策略 generate，全部通过。此次输出为 `/private/tmp/moe-post-cli-b0QHGC/run`，仅是合成工程验证。
+- RL 指南 19 个 Bash 块通过语法检查，24 条 CLI 命令通过参数解析，README 图片路径全部存在。
+- 未启动正式 264M RL 或用户服务器 CUDA/NCCL 实验；不存在经核验的 RL 奖励/任务能力提升结论。PPO/GRPO 目前顺序 rollout，不是高吞吐 RL 框架。当前只提供 fp32/bf16，不提供 fp16 post-training scaler。
+
+## RL 真实数据准备验证（2026-10-03）
+
+- 固定版本 MiniMind DPO 下载通过大小/SHA256 校验；17,166 对读取、17,137 对保留、17,021 个不同 prompt。
+- 官方 GSM8K 固定提交下载通过大小/SHA256 校验；转换 train 7,473、test 1,319。
+- byte tokenizer / 2048 长度下，测试专用准备目录 train 为 0，val 为 1,319；不代表生产 BPE / 448 的保留数量。
+- `tests/test_rl_sources.py` 和 `tests/test_posttraining.py`：11 passed。指南 24 个 Bash 代码块语法检查通过，25 个已有训练 CLI 命令参数检查通过。
+- 仅验证数据准备和训练回归，没有执行正式 RL 训练或报告质量提升。

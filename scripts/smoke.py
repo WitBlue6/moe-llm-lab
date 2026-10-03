@@ -10,6 +10,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, help="new directory for test runs/logs")
     parser.add_argument("--vision", action="store_true", help="requires uv --extra vision")
+    parser.add_argument("--posttrain", action="store_true", help="also check native DPO/reward/PPO/GRPO on synthetic data")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     root = Path(args.output).resolve()
@@ -52,6 +53,33 @@ def main():
             raise AssertionError("pure-text logits changed")
         run("visual-generation", "vision-generate", "--base-checkpoint", base, "--checkpoint", adapter,
             "--image", root / "visual-raw/images/color-00.png", "--prompt", "Describe the image.", "--temperature", 0, "--max-new-tokens", 8)
+    if args.posttrain:
+        raw = root / "preference-fixture.jsonl"
+        with raw.open("x") as handle:
+            for i in range(80):
+                handle.write(json.dumps({"prompt": f"{i}+1=?", "chosen": str(i+1),
+                                         "rejected": str(i+2), "answer": str(i+1)}) + "\n")
+        for kind in ("preferences", "prompts"):
+            run(f"post-prepare-{kind}", "post-prepare", "--input", raw, "--kind", kind,
+                "--output", root / kind, "--max-seq-len", 64, "--val-ratio", .25)
+        for algorithm in ("dpo", "reward", "ppo", "grpo"):
+            from moe_llm.posttraining import PosttrainConfig
+            from dataclasses import asdict
+            config = PosttrainConfig(algorithm=algorithm, max_steps=2, warmup_steps=0,
+                batch_size=1, grad_accum_steps=1, group_size=2, update_epochs=2,
+                max_new_tokens=4, eval_every=1, save_every=1, eval_max_records=2,
+                precision="fp32", device="cpu", reward="numeric")
+            path = root / f"{algorithm}.json"
+            path.write_text(json.dumps(asdict(config)))
+            data = root / ("preferences" if algorithm in ("dpo", "reward") else "prompts")
+            run(algorithm, "post-train", "--base-checkpoint", base, "--config", path,
+                "--data", data, "--output", root / algorithm)
+            run(f"{algorithm}-evaluation", "post-evaluate", "--base-checkpoint", base,
+                "--checkpoint", root / algorithm / "step-0000002.pt", "--data", data,
+                "--device", "cpu", "--max-records", 2)
+            if algorithm != "reward":
+                run(f"{algorithm}-generation", "generate", "--checkpoint", root / algorithm / "step-0000002.pt",
+                    "--chat", "--prompt", "2+1=?", "--max-new-tokens", 4, "--temperature", 0)
     (root / "SMOKE_ONLY.txt").write_text("Synthetic engineering verification only. Not a capable pretrained model or benchmark.\n")
     print(f"All smoke checks passed. Artifacts: {root}")
 

@@ -2,9 +2,46 @@
 
 以**完整掌握流程**为目标，用原生 PyTorch 搭建小型 MoE 语言模型。
 
-已实现文本网络、tokenizer、预训练、全参数 SFT、评测、生成、恢复和 DDP；现已加入手写 SigLIP 视觉网络（可加载外部权重，或用图文对从零训练）、冻结视觉基座、投影层、视觉 LoRA、视觉对齐/视觉 SFT、图文生成与文本保留检查。DPO、奖励模型、PPO、GRPO 和独立文本 LoRA 微调仍为后续阶段。
+已实现文本网络、tokenizer、预训练、全参数 SFT、评测、生成、恢复和 DDP；加入手写 SigLIP 视觉网络（可加载外部权重，或用图文对从零训练）、冻结视觉基座、投影层、视觉 LoRA、视觉对齐/视觉 SFT、图文生成与文本保留检查。文本 SFT 后支持原生 DPO、偏好奖励模型、共享 critic 的 PPO 与 GRPO，提供单卡/多卡训练、恢复与独立评测；独立文本 LoRA 对照仍待实现。
 
 **开始正式训练请先读 [逐步训练指南](docs/training-guide.md)**：先完成第 0–8 步文本训练，再进行视觉训练。
+
+**文本后训练见 [SFT 后 DPO/PPO/GRPO 指南](docs/rl-training-guide.md)**。 指南包含 MiniMind 偏好数据与 GSM8K 的固定版本下载、格式转换和独立测试集准备命令。三条路线分别从同一个文本 SFT 出发；在线算法可用可核验答案或训练后的奖励模型，不把合成数据跑通等同于能力提升。
+
+## 用户训练曲线
+
+以下为运行者提供的训练图，分别展示 `train_loss`、MoE `aux_loss` 与实际验证步上的 `val_loss`；预训练图叠加了最近 50 步均值。图例的目录标识各阶段 run。曲线显示这些实验的 loss 总体下降，但当前没有相应原始 run 元数据的完整审计，不能从图片推断数据预算、全量验证范围、泛化能力或相对其他项目的提升。
+
+### 文本预训练
+
+![文本预训练损失曲线](docs/figs/text-pretrain-loss.png)
+
+### 文本 SFT
+
+![文本 SFT 损失曲线](docs/figs/text-sft-001-loss.png)
+
+### 视觉对齐
+
+![视觉对齐损失曲线](docs/figs/vision-align-001-loss.png)
+
+### 视觉 SFT
+
+![视觉 SFT 损失曲线](docs/figs/vision-sft-001-loss.png)
+
+不同阶段监督目标和数据不同，不能直接横比 loss 数值。VLM 质量还需图像置零、换图问答与纯文本回归，RL 改进需固定问题集和奖励外的质量检查。
+
+## 文本偏好与在线策略训练
+
+`post-prepare` 准备按 prompt 哈希留出的偏好对或在线问题；`post-train` 按配置选择 DPO、reward、PPO、GRPO；`post-evaluate` 提供偏好 loss/准确率或生成奖励验证。策略权重兼容原 `generate/evaluate`，奖励模型使用独立格式。
+
+- DPO：completion-only 序列 log-prob 求和，原始 SFT reference 冻结，beta 控制偏好目标。
+- reward：同一个 prompt 的 chosen/rejected 成对排序，学习独立奖励主干和标量 head。
+- PPO：actor 主干与 value head 共享，终局任务奖励＋逐 token reference KL，GAE、全局优势归一化、policy/value clipping、多次更新。
+- GRPO：每 prompt 多回答、组内标准化优势、clipped policy objective 和 reference KL，无 critic。
+
+在线采样温度及特殊 token mask 在概率重算时一致；支持 EOS 与回答上限终止。每卡完整模型副本，通过显式梯度归约进行数据并行，在线 rollout 顺序生成，不包含专家并行或高吞吐推理后端。DPO/reward 以 `val_loss` 保存 best；PPO/GRPO 验证生成奖励，没有伪造 CE `val_loss` 或按 policy loss 选 best。
+
+新增链路仅以微型模型和合成任务完成工程验收，没有正式 RL 能力提升结论。详细数据格式、单卡/八卡命令、奖励模型接入、epoch 语义、恢复与显存边界见 [RL 指南](docs/rl-training-guide.md)。
 
 视觉两条路线、数据下载与转换、从零训练及 VLM 接入命令见训练指南第 9–13 步。小规模 SigLIP 式预训练不是官方训练配方/效果复现；当前新增链路仅完成工程测试。
 
@@ -20,7 +57,7 @@
 
 主配置：16 层、hidden 768、GQA 12/4 heads、4 个 SwiGLU 专家、top-2 路由、16K 词表、最大上下文 2048。支持 Dense FFN（`num_experts=experts_per_token=1`）、RoPE、RMSNorm、共享 embedding、负载均衡损失及 activation checkpointing。
 
-激活参数统计包含完整 embedding 表，与 FLOPs、显存和实测速度不同。主配置只是建议起点，**尚未在用户的 8 卡 3090 上训练或测量显存**。未来 PPO 同时涉及多个模型和 rollout，保留小 batch、梯度累积和缩短序列的余地。
+激活参数统计包含完整 embedding 表，与 FLOPs、显存和实测速度不同。用户已提供上面的训练曲线，八卡主模型的完整配置、显存与吞吐仍需结合原始 run 日志核验。PPO 同时涉及多个模型和 rollout，保留小 batch、梯度累积和缩短序列的余地。
 
 ## 安装与测试
 

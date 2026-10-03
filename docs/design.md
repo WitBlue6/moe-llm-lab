@@ -6,7 +6,7 @@ Decoder-only Transformer，每层采用 pre-norm attention 和 pre-norm FFN，�
 
 每个 token 的 router 在 float32 下得到专家 softmax，选 top-k 后重新归一化权重。只向选中的专家派发有效 token，再加权汇总。没有 capacity 截断、token dropping 或共享专家。按层记录专家分配比例与路由熵。pad token 不参与派发或负载统计。
 
-辅助损失为 `E * sum(mean_assignment_fraction * mean_router_probability)`，在层之间取平均。top-k 的 assignment fraction 总和为 1。训练器按各微批有效输入 token 数加权该辅助损失；它是微批局部负载均衡目标，并非整个全局 batch 上重新计算的非线性均衡目标。
+辅助损失为 `E * sum(mean_assignment_fraction * mean_router_probability)`，在层之间取平均。top-k 的 assignment fraction 总和为 1。文本/VLM 训练器按各微批有效输入 token 数加权该辅助损失；它是微批局部负载均衡目标，并非整个全局 batch 上重新计算的非线性均衡目标。后训练器按偏好对或回答平均主目标，aux 也按对/回答平均，具体见 RL 指南。
 
 `num_experts=1, experts_per_token=1` 使用无 router 的 Dense SwiGLU。参数量比较必须明确总参数还是激活参数，不能直接用激活参数推断运行速度。
 
@@ -16,7 +16,7 @@ Decoder-only Transformer，每层采用 pre-norm attention 和 pre-norm FFN，�
 
 SFT 格式为 `[BOS, ROLE, content, EOS, ROLE, content, EOS, ...]`。角色标记、system/user 内容以及它们的 EOS 均不参与监督；assistant 内容与 EOS 参与监督。先构造 mask，再 shift，模型不再二次 shift。长于上限的 SFT 样本整条跳过，并记录数量；不会给被截断回答伪造 EOS。
 
-`token_log_probs` 接受已 shift 的标签，返回逐 token log-prob 与有效位置 mask；这是后续 DPO/PPO 的基础操作。PPO 所需 value head、GAE、rollout buffer、旧策略概率和奖励模型均尚未实现。
+`token_log_probs` 接受已 shift 的标签，返回逐 token log-prob 与有效位置 mask。文本后训练见 `posttraining.py` / `rl_objectives.py`：DPO 的完成序列概率求和、偏好奖励模型、共享 actor 主干的 PPO value head、GAE、固定旧策略 rollout，以及无 critic 的 GRPO 已实现。在线采样分布与更新中的温度/控制 token mask 一致；只在回答 token 上更新，EOS 和长度上限在有限回答任务中都作为终止。
 
 ## 数据
 
@@ -40,11 +40,11 @@ CE 先求每个微批的有效 token loss sum，收集整个累积组在所有 r
 
 ## 已知限制
 
-- 尚无真实语料/正式 checkpoint，也没有模型质量或算法提升结论。
-- 主配置未在服务器实测；CPU/Gloo 测试不能证明 CUDA/NCCL 吞吐或数值稳定性。
+- 用户已提供文本与视觉训练曲线，但原始 run 与正式 checkpoint 未在本机完成审计；RL 暂无正式模型质量或算法提升结论。
+- 后训练主配置尚需服务器验收；CPU/Gloo 测试不能证明 CUDA/NCCL 吞吐或数值稳定性。
 - 生成 CLI 当前每次一条未 padding 的 prompt；没有批量变长生成、流式 API、beam search 或采样服务。
 - 训练不支持 MPS、FSDP、ZeRO、跨卡专家并行、长上下文外推或 fused MoE kernel。
-- DPO、PPO、奖励模型、独立文本 LoRA、GRPO 均为后续阶段；视觉 LoRA 已实现。
+- DPO、PPO、奖励模型和 GRPO 已加入原生教学训练器，支持显式梯度归约的数据并行。独立文本 LoRA 仍为后续对照；视觉 LoRA 已实现。
 - perplexity 只在相同 tokenizer/数据/监督位置规则下适合比较；SFT perplexity 不等同通用语言建模 perplexity。
 
 

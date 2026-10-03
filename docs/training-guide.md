@@ -371,7 +371,7 @@ uv run --locked moe-lab generate \
 
 记录并固定选中的 SFT checkpoint 路径、它的 tokenizer、配置、固定评测结果。后续视觉 checkpoint 会绑定其 SHA256。不要移动后又丢失它，也不要用新的训练覆盖它。
 
-**到这里，你要先开展的基础文本训练就完整了。** DPO、PPO 尚未实现；不需要等它们才能开始下一阶段视觉扩展。
+**到这里，基础文本训练流程完整了。** 如果继续文本后训练，见 [SFT 后 DPO/PPO/GRPO 指南](rl-training-guide.md)；如果继续视觉扩展，从下节开始。两者可以作为独立实验，不要求先执行 RL。
 
 ## 9. 视觉网络与权重来源：二选一
 

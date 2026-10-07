@@ -1,8 +1,19 @@
 # 从文本 SFT 到 DPO、PPO、GRPO：后训练指南
 
-更新：2026-10-03。目标是理解后训练全过程；默认基座为本项目约 264M 的文本 SFT 模型，单机 8×3090。原生 PyTorch 实现，不依赖 TRL/远程模型/API。当前验收使用微型合成模型和 CPU/Gloo；主模型 CUDA 的显存、速度与质量必须在服务器短跑后判断。
+更新：2026-10-04。目标是理解后训练全过程；默认基座为本项目约 264M 的文本 SFT 模型，单机 8×3090。原生 PyTorch 实现，不依赖 TRL/远程模型/API。当前验收使用微型合成模型和 CPU/Gloo；主模型 CUDA 的显存、速度与质量必须在服务器短跑后判断。
 
 **三种算法从同一 SFT 分别开始，是对照路线，不要求依次 DPO→PPO→GRPO。** DPO 是离线偏好优化；PPO/GRPO 才是在线生成、打分和策略更新。不能把“代码跑通”称为已得到能力提升。
+
+本指南默认按 epoch 正式训练：
+
+| 路线 | 首次正式预算 | 选择理由 |
+|---|---|---|
+| DPO | 1 epoch | 先完整遍历偏好对，结合验证偏好准确率和回答质量判断是否继续 |
+| 奖励模型 | 2 epochs | 给新增评分 head 和主干两轮学习机会，使用 val_loss 最低的 best，避免默认采用最后一轮 |
+| PPO | 1 prompt epoch | 每题在线生成成本较高，先完成一次问题集遍历，检查奖励、KL 和回答质量 |
+| GRPO | 1 prompt epoch | 每题生成多份回答，先确认奖励有区分，再决定是否增加问题遍历轮数 |
+
+PPO/GRPO 的 `update_epochs=2` 保持不变：每批 rollout 重复优化两次，和遍历问题集的 epoch 不同。这些是本项目首次实验的起始预算，尚无主模型实测依据支持它们是最优值。奖励模型若第二轮验证变差，取第一轮或更早的 best；在线奖励长期无信号时先调整任务/奖励，而不是增加 epoch。调整预算须在新实验开始前修改变量和配置，恢复中途不能改变。
 
 ## 0. 同步环境、固定 SFT 基座
 
@@ -17,7 +28,35 @@ uv run --locked pytest -q tests/test_posttraining.py tests/test_posttraining_ddp
 uv run --locked python scripts/smoke.py --output runs/posttrain-smoke-001 --posttrain
 uv run --locked moe-lab post-train --help
 export TOK=data/tokenizer-v1.json
-export RL_RUN=post-v1-20261003
+export RL_RUN=post-epoch-v1-20261004
+export DPO_EPOCHS=1
+export REWARD_EPOCHS=2
+export PPO_EPOCHS=1
+export GRPO_EPOCHS=1
+```
+
+
+定义 checkpoint 读取函数，后续评测与恢复复用；`final` 从 summary 读取实际最终 step，`latest` 查找最新已保存文件，`best` 读取验证最佳文件：
+
+```bash
+checkpoint_path() {
+  uv run --locked python - "$1" "${2:-final}" <<'PYCODE'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]);mode=sys.argv[2]
+if mode=='best':
+    path=Path(json.loads((root/'best.json').read_text())['checkpoint'])
+elif mode=='latest':
+    files=list(root.glob('step-*.pt'))
+    if not files: raise SystemExit(f'No saved checkpoint in {root}')
+    path=max(files,key=lambda p:int(p.stem.split('-')[1]))
+else:
+    step=json.loads((root/'summary.json').read_text())['step']
+    path=root/f'step-{step:07d}.pt'
+if not path.is_file(): raise SystemExit(f'Missing checkpoint: {path}')
+print(path)
+PYCODE
+}
 ```
 
 选择你的文本 SFT run；下面目录按新曲线中的名称示例，实际不同请改：
@@ -141,11 +180,12 @@ uv run --locked python scripts/prepare_rl_test.py \
   --tokenizer "$TOK" --max-seq-len 448
 ```
 
-这个目录 train 为空，全部保留样本放在 val，专供 `post-evaluate`，不要用于 `post-train`。训练完成后，将下面 checkpoint 改成实际选定权重；`--max-records 1319` 覆盖全部保留测试题，实际数量和长度过滤见 manifest：
+这个目录 train 为空，全部保留样本放在 val，专供 `post-evaluate`，不要用于 `post-train`。完成第 6 步正式 GRPO 训练后读取实际最终权重；`--max-records 1319` 覆盖全部保留测试题，实际数量和长度过滤见 manifest：
 
 ```bash
+POLICY=$(checkpoint_path "runs/$RL_RUN-grpo" final)
 uv run --locked moe-lab post-evaluate \
-  --checkpoint "runs/$RL_RUN-grpo/step-0000100.pt" --base-checkpoint "$SFT" \
+  --checkpoint "$POLICY" --base-checkpoint "$SFT" \
   --data data/gsm8k-test-v1 --tokenizer "$TOK" --device cuda --max-records 1319 \
   --output "reports/$RL_RUN-grpo-gsm8k-test.json"
 ```
@@ -169,16 +209,17 @@ preferences 的 512 包含 prompt＋回答＋EOS，过长整个偏好对跳过�
 
 ## 3. 固定实验配置
 
-模板 `configs/post-{dpo,reward,ppo,grpo}.json` 是起点。复制后在正式训练前调整，不改正在运行的文件：
+模板 `configs/post-{dpo,reward,ppo,grpo}.json` 是起点。以下复制命令写入推荐 epochs；命令行再显式传相同轮数。配置中的 max_steps 会被 epochs 换算值覆盖。复制后在正式训练前调整，不改正在运行的文件：
 
 ```bash
 export RL_CFG=configs/$RL_RUN
 uv run --locked python - "$RL_CFG" <<'PY'
-import json,sys
+import json,os,sys
 from pathlib import Path
 root=Path(sys.argv[1]); root.mkdir(parents=True,exist_ok=False)
 for name in ('dpo','reward','ppo','grpo'):
     c=json.loads((Path('configs')/f'post-{name}.json').read_text())
+    c['epochs']=int(os.environ[f'{name.upper()}_EPOCHS'])
     with (root/f'{name}.json').open('x') as f: json.dump(c,f,indent=2)
 PY
 ```
@@ -200,7 +241,7 @@ PY
 CUDA_VISIBLE_DEVICES=0 uv run --locked moe-lab post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/dpo.json" \
   --data data/preferences-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-dpo-pilot-1gpu" --stop-after 3
+  --output "runs/$RL_RUN-dpo-pilot-1gpu" --stop-after 3 --epochs "$DPO_EPOCHS"
 ```
 
 八卡短跑：
@@ -210,7 +251,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/dpo.json" \
   --data data/preferences-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-dpo-pilot-8gpu" --stop-after 3
+  --output "runs/$RL_RUN-dpo-pilot-8gpu" --stop-after 3 --epochs "$DPO_EPOCHS"
 ```
 
 确认保存、有限梯度、验证和数据正常后启动新目录：
@@ -219,7 +260,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/dpo.json" \
-  --data data/preferences-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-dpo"
+  --data data/preferences-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-dpo" --epochs "$DPO_EPOCHS"
 ```
 
 公式为 `-log sigmoid(beta × [(logπ(chosen)-logπ(rejected))-(logref(chosen)-logref(rejected))])`，使用完成序列 log-prob **求和**，只监督最终回答和 EOS。训练另有 router aux。reference 始终是原始 SFT，不随 actor 更新。观察 `train_preference_accuracy`、`val_preference_accuracy`、`val_loss`，结合人工检查；偏好指标不等于一般聊天能力。
@@ -243,13 +284,13 @@ uv run --locked moe-lab generate --checkpoint "$DPO" --tokenizer "$TOK" --chat \
 
 ## 5. PPO：先使用可核验奖励
 
-默认 `reward=numeric`，适用于上面的加法数据；其他任务先改配置匹配奖励定义。短跑前不要把所有开放式回答当数字评分。
+默认 `reward=numeric`，适用于 GSM8K 或上面的加法数据；其他任务先改配置匹配奖励定义。短跑前不要把所有开放式回答当数字评分。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run --locked moe-lab post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/ppo.json" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-ppo-pilot-1gpu" --stop-after 3
+  --output "runs/$RL_RUN-ppo-pilot-1gpu" --stop-after 3 --epochs "$PPO_EPOCHS"
 ```
 
 正式八卡（首次八卡建议换 pilot 目录并加 `--stop-after 3`）：
@@ -258,7 +299,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --locked moe-lab post-train \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/ppo.json" \
-  --data data/rl-prompts-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-ppo"
+  --data data/rl-prompts-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-ppo" --epochs "$PPO_EPOCHS"
 ```
 
 采样时记录精确 token IDs、旧策略 log-prob、reference log-prob 和旧 values。每 token 奖励先减 `kl_coef × (old_logp-ref_logp)`，最后一个回答 token 加任务奖励；用 GAE 计算 returns/advantages，全局回答 token whitening，再优化 clipped policy loss、clipped value loss 和可选 entropy。rollout 完成后按 `update_epochs` 重复更新，旧概率保持固定。
@@ -275,12 +316,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
 CUDA_VISIBLE_DEVICES=0 uv run --locked moe-lab post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/grpo.json" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-grpo-pilot-1gpu" --stop-after 3
+  --output "runs/$RL_RUN-grpo-pilot-1gpu" --stop-after 3 --epochs "$GRPO_EPOCHS"
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/grpo.json" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-grpo-pilot-8gpu" --stop-after 3
+  --output "runs/$RL_RUN-grpo-pilot-8gpu" --stop-after 3 --epochs "$GRPO_EPOCHS"
 ```
 
 通过后正式运行：
@@ -289,7 +330,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/grpo.json" \
-  --data data/rl-prompts-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-grpo"
+  --data data/rl-prompts-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-grpo" --epochs "$GRPO_EPOCHS"
 ```
 
 重点检查 `zero_variance_group_fraction`。若长期 1，任务奖励没有组内区分，policy 的奖励优势为 0；仍可能因 KL/aux 更新参数，不能把参数变化当成学到了奖励。应检查任务难度、基座能力、奖励和采样，不盲目扩大步数。
@@ -302,11 +343,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
 CUDA_VISIBLE_DEVICES=0 uv run --locked moe-lab post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/reward.json" \
   --data data/preferences-v1 --tokenizer "$TOK" \
-  --output "runs/$RL_RUN-reward-pilot-1gpu" --stop-after 3
+  --output "runs/$RL_RUN-reward-pilot-1gpu" --stop-after 3 --epochs "$REWARD_EPOCHS"
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/reward.json" \
-  --data data/preferences-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-reward"
+  --data data/preferences-v1 --tokenizer "$TOK" --output "runs/$RL_RUN-reward" --epochs "$REWARD_EPOCHS"
 ```
 
 读取 reward best，先检查留出偏好准确率，不能仅凭 loss 使用：
@@ -332,14 +373,14 @@ for name in ('ppo','grpo'):
 PY
 ```
 
-启动新的 PPO-RM 实验，GRPO 将配置改为 `grpo-rm.json` 即可：
+启动新的 PPO-RM 实验，GRPO 改用 `grpo-rm.json`、输出目录 `grpo-rm` 和 `--epochs "$GRPO_EPOCHS"`：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/ppo-rm.json" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" --reward-checkpoint "$RM" \
-  --output "runs/$RL_RUN-ppo-rm"
+  --output "runs/$RL_RUN-ppo-rm" --epochs "$PPO_EPOCHS"
 ```
 
 奖励模型路线每卡多一份冻结模型，先单卡新目录短跑测峰值显存。真实一般聊天需要一般聊天偏好数据和相同分布的 prompts，不能用加法 reward model 给所有领域打分。任务奖励增加也可能是奖励投机，保留独立人工/规则评测。
@@ -349,7 +390,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
 PPO/GRPO 不伪造 CE `val_loss`，记录 `val_reward`；当前保留定期/最终 checkpoint，没有基于 RL train_loss 的 best。选中实际存在的文件后评测同一固定问题集：
 
 ```bash
-export POLICY="runs/$RL_RUN-grpo/step-0000100.pt"
+POLICY=$(checkpoint_path "runs/$RL_RUN-grpo" final)
 test -f "$POLICY"
 uv run --locked moe-lab post-evaluate --checkpoint "$POLICY" --base-checkpoint "$SFT" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" --device cuda --max-records 128 \
@@ -358,13 +399,61 @@ uv run --locked moe-lab generate --checkpoint "$POLICY" --tokenizer "$TOK" --cha
   --prompt '计算 17+25，只输出一个数字。' --max-new-tokens 64 --temperature 0
 ```
 
-上述 step100 假设保留模板总步数；epoch 模式或 stop-after 后要换成实际 step。reward=model 评测也传同一 `--reward-checkpoint "$RM"`。独立 `post-evaluate` 使用 `--max-records`，不支持 `--eval-max-batches`。
+以上从 summary 读取实际最终 step，不假设固定步数。评测 PPO 时改 run 目录为 ppo；奖励模型路线改为 ppo-rm/grpo-rm。reward=model 评测也传同一 `--reward-checkpoint "$RM"`。独立 `post-evaluate` 使用 `--max-records`，不支持 `--eval-max-batches`。
 
 留出 val 用于调参；最终验收另备冻结的 test 问题，用新数据目录的 val 侧作为显式评测输入，记录其准备方法。不能不断查看同一 test 调参后仍称独立测试。建议同题比较 SFT、DPO、PPO、GRPO 的质量、长度、奖励、KL 和成本，而不是只比较单次输出。
 
 策略 checkpoint 兼容现有 `moe-lab generate/evaluate`；奖励模型 checkpoint 不作为聊天模型。普通 `evaluate` 还可用原文本 SFT 验证集检查 CE 遗忘，保持相同精度与数据范围。
 
+### 绘制 post-training reward 与诊断曲线
+
+安装锁定的绘图依赖；脚本只读 `metrics.jsonl`，不加载权重、不运行验证，也不会修改训练结果。输出路径必须不存在，支持 PNG/PDF/SVG：
+
+```bash
+uv sync --locked --extra plot
+uv run --locked --extra plot python scripts/plot_posttraining.py \
+  --runs "runs/$RL_RUN-ppo" --output "reports/$RL_RUN-ppo-metrics.png" \
+  --smooth-window 20
+```
+
+实际 run 名不同则替换 `--runs`；例如本次四轮 PPO 使用：
+
+```bash
+uv run --locked --extra plot python scripts/plot_posttraining.py \
+  --runs runs/post-epoch-v1-20261007-ppo \
+  --output reports/post-ppo-001-reward.png --smooth-window 20 \
+  --metrics train_reward val_reward reference_kl val_kl truncated_fraction value_loss
+```
+
+DPO/奖励模型显示留出偏好 loss 与准确率；也可按同类指标对比多个 run：
+
+```bash
+uv run --locked --extra plot python scripts/plot_posttraining.py \
+  --runs "runs/$RL_RUN-dpo" --output "reports/$RL_RUN-dpo-metrics.png" \
+  --metrics train_loss val_loss train_preference_accuracy val_preference_accuracy
+```
+
+`--runs` 后可传多个目录或 metrics.jsonl；`--labels` 为每个输入提供一个图例名称。默认只画已有指标；显式 `--metrics` 选中但未记录的指标会标为不适用。非验证曲线可作滑动平均，原始曲线仍以淡色显示；验证曲线只画实际评测点，不填充、不平滑。训练中也可读取日志快照，未写完的末行忽略并警告。
+
+PPO/GRPO 重点看 train_reward、val_reward、reference_kl、val_kl 和 truncated_fraction；PPO 另看 value_loss/clip_fraction，GRPO 另看 zero_variance_group_fraction。numeric 奖励为 0/1 时平均 reward 对应评分规则下的答案正确率；model reward 是奖励模型分数，不能称为正确率。横轴为日志 step，在线算法表示 rollout 批次，不是 optimizer 更新次数。不同奖励规则或验证题集的 run 不应直接据曲线高低判断优劣。
+
 ## 9. epoch、恢复与输出
+
+### 两种 epoch 的含义
+
+RL 可以使用 epoch。DPO 使用固定偏好对，和 SFT 类似，一轮遍历一次训练数据。PPO/GRPO 每批先从问题集中取 prompt，再由当前策略生成新回答（rollout）、评分、计算优势、更新策略。下一批重新生成回答；第二轮遍历同一个问题集时，回答也重新采样，并不复用上一轮全部回答。
+
+- `--epochs N` / 配置 `epochs`：问题集（DPO/reward 是偏好对）遍历 N 轮，覆盖配置中的 `max_steps`。
+- 配置 `update_epochs`：仅 PPO/GRPO 使用；同一批 rollout 重复优化几次。当前实现每次重复进行一次全批梯度累积后的优化器更新，旧策略概率不变，不重新生成回答。DPO/reward 忽略这个字段。
+- PPO/GRPO 的日志 step：收集一批 rollout 并完成所有重复更新；例如 `update_epochs=2`，一个 step 对应两次 optimizer update。
+
+单卡每轮步数为 `ceil(ceil(训练记录数 / batch_size) / grad_accum_steps)`；八卡先将记录分给各卡，按 `ceil(记录数/8)` 计算每卡记录数，再计算 batch 和累积步数。分布式采样器为对齐各卡长度可能补齐少量记录。`group_size` 增加 GRPO 每题回答数，不增加每轮 prompt step 数。末尾不足完整累积批的部分照常更新，不跨到下一轮凑齐。
+
+### 使用前面的正式命令
+
+第 4～7 步的短跑、正式命令均已加上对应的 `--epochs`，按所选路线执行即可，不需要额外循环运行四种算法。短跑仍加 `--stop-after 3`，只检查三个 step，不改变完整 epoch 对应的学习率计划；正式训练用新目录，从原始 SFT 开始，不恢复单卡 pilot 到八卡。
+
+启动日志 `training_budget` 给出 `steps_per_epoch` 和换算后的 `max_steps`。DPO/reward 的总 optimizer 更新量为 `max_steps`；PPO/GRPO 为 `max_steps × update_epochs`。小数据集若总步数不大于 warmup_steps，先降低 warmup_steps 后开始新实验。
 
 - `post-train --epochs N` 覆盖配置 max_steps。DPO/reward 一轮步数按 prompt/pair 数和 batch/累积计算；PPO/GRPO 一轮表示把 prompt 采样器走完一次，不是每条生成回答只更新一次。
 - PPO/GRPO 一个日志 step 是一批 rollout，含 `update_epochs` 次优化器更新；累计看 `optimizer_updates`。`grad_accum_steps` 控制每批收集的 prompt 微批数，online 更新顺序逐回答反传；不扩大单次微批 forward。
@@ -374,12 +463,13 @@ uv run --locked moe-lab generate --checkpoint "$POLICY" --tokenizer "$TOK" --cha
 仅中断后恢复，文件必须存在，保留相同 base、config、data、tokenizer、reward、world size、代码和环境，换新输出：
 
 ```bash
+RESUME=$(checkpoint_path "runs/$RL_RUN-grpo" latest)
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run --locked torchrun \
   --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli post-train \
   --base-checkpoint "$SFT" --config "$RL_CFG/grpo.json" \
   --data data/rl-prompts-v1 --tokenizer "$TOK" \
-  --resume "runs/$RL_RUN-grpo/step-0000020.pt" \
-  --output "runs/$RL_RUN-grpo-resumed"
+  --resume "$RESUME" \
+  --output "runs/$RL_RUN-grpo-resumed" --epochs "$GRPO_EPOCHS"
 ```
 
 epochs 模式恢复须重复同样的 `--epochs N`。新版会改变代码指纹，旧文本/VLM 训练仍用原代码精确恢复；已完成 SFT 可作新版 base。此入口不支持中途改预算，也不提供从其他算法 checkpoint 直接 init-from 的捷径。

@@ -1,65 +1,67 @@
 # MoE LLM Lab
 
-以**完整掌握流程**为目标，用原生 PyTorch 搭建小型 MoE 语言模型。
+**从零搭建 MoE 语言模型，贯通文本预训练、指令微调、视觉扩展与偏好及强化学习后训练。**
 
-已实现文本网络、tokenizer、预训练、全参数 SFT、评测、生成、恢复和 DDP；加入手写 SigLIP 视觉网络（可加载外部权重，或用图文对从零训练）、冻结视觉基座、投影层、视觉 LoRA、视觉对齐/视觉 SFT、图文生成与文本保留检查。文本 SFT 后支持原生 DPO、偏好奖励模型、共享 critic 的 PPO 与 GRPO，提供单卡/多卡训练、恢复与独立评测；独立文本 LoRA 对照仍待实现。
+MoE LLM Lab 使用原生 PyTorch 实现核心网络和训练目标，以可阅读的代码组织完整的模型训练流程。项目包含自训练 BPE tokenizer、稀疏专家解码器、SigLIP 式图文编码器、视觉投影与 LoRA，以及 DPO、奖励模型、PPO 和 GRPO，可用于学习模型结构、复现训练阶段和开展对照实验。
 
-**开始正式训练请先读 [逐步训练指南](docs/training-guide.md)**：先完成第 0–8 步文本训练，再进行视觉训练。
+[文本与视觉训练指南](docs/training-guide.md) · [后训练指南](docs/rl-training-guide.md) · [数据指南](docs/data-guide.md) · [设计文档](docs/design.md)
 
-**文本后训练见 [SFT 后 DPO/PPO/GRPO 指南](docs/rl-training-guide.md)**。 指南包含 MiniMind 偏好数据与 GSM8K 的固定版本下载、格式转换和独立测试集准备命令。三条路线分别从同一个文本 SFT 出发；在线算法可用可核验答案或训练后的奖励模型，不把合成数据跑通等同于能力提升。
+## 项目特性
 
-## 训练曲线
+- **语言模型**：RMSNorm、RoPE、GQA、SwiGLU、top-k 专家路由、负载均衡辅助损失与共享词嵌入；支持 Dense FFN 对照配置。
+- **文本训练**：BPE 训练、JSONL 数据准备、预训练、全参数 SFT、生成与独立评测；SFT 仅监督 assistant 回答。
+- **视觉扩展**：手写 SigLIP 式网络，支持加载兼容预训练权重或通过图文对训练；视觉对齐训练 projector，视觉 SFT 训练 projector 和 Q/V LoRA。
+- **文本与图文双路径**：视觉适配阶段冻结语言基座；图像会话启用视觉 LoRA，纯文本会话关闭视觉 LoRA，使用原始文本路径。
+- **偏好与策略学习**：实现 DPO、成对排序奖励模型、共享主干 value head 的 PPO，以及无 critic 的 GRPO；在线奖励支持可核验答案或冻结奖励模型。
+- **实验管理**：单卡与多卡数据并行、混合精度、梯度累积、activation checkpointing、epoch/step 预算、断点恢复、进度条和结构化指标日志。
+- **评测与可视化**：记录数据、配置与 checkpoint 指纹；支持验证最佳权重、文本保留检查，以及 loss、reward、KL 和训练诊断曲线绘制。
 
-以下为训练 1 epoch 的训练图，分别展示 `train_loss`、MoE `aux_loss` 与实际验证步上的 `val_loss`；预训练图叠加了最近 50 步均值。图例的目录标识各阶段 run。曲线显示这些实验的 loss 总体下降，但当前没有相应原始 run 元数据的完整审计，不能从图片推断数据预算、全量验证范围、泛化能力或相对其他项目的提升。
+## 训练路线
 
-### 文本预训练
+```mermaid
+flowchart LR
+    A[文本语料与 BPE] --> B[MoE 预训练]
+    B --> C[文本 SFT]
+    C --> D[DPO]
+    C --> E[PPO / GRPO]
+    F[偏好对] --> D
+    F --> G[奖励模型]
+    G --> E
+    H[可核验答案奖励] --> E
+    C --> I[视觉对齐：Projector]
+    J[SigLIP 式视觉编码器] --> I
+    I --> K[视觉 SFT：Projector + LoRA]
+    K --> L[纯文本与图文生成]
+```
 
-![文本预训练损失曲线](docs/figs/text-pretrain-loss.png)
+DPO、PPO、GRPO 是从文本 SFT 出发的不同后训练路线，可以分别开展实验。视觉路线将冻结的图像编码器特征映射到语言模型输入空间，使用独立 adapter checkpoint 保存视觉适配参数。
 
-### 文本 SFT
-
-![文本 SFT 损失曲线](docs/figs/text-sft-001-loss.png)
-
-### 视觉对齐
-
-![视觉对齐损失曲线](docs/figs/vision-align-001-loss.png)
-
-### 视觉 SFT
-
-![视觉 SFT 损失曲线](docs/figs/vision-sft-001-loss.png)
-
-不同阶段监督目标和数据不同，不能直接横比 loss 数值。VLM 质量还需图像置零、换图问答与纯文本回归，RL 改进需固定问题集和奖励外的质量检查。
-
-## 文本偏好与在线策略训练
-
-`post-prepare` 准备按 prompt 哈希留出的偏好对或在线问题；`post-train` 按配置选择 DPO、reward、PPO、GRPO；`post-evaluate` 提供偏好 loss/准确率或生成奖励验证。策略权重兼容原 `generate/evaluate`，奖励模型使用独立格式。
-
-- DPO：completion-only 序列 log-prob 求和，原始 SFT reference 冻结，beta 控制偏好目标。
-- reward：同一个 prompt 的 chosen/rejected 成对排序，学习独立奖励主干和标量 head。
-- PPO：actor 主干与 value head 共享，终局任务奖励＋逐 token reference KL，GAE、全局优势归一化、policy/value clipping、多次更新。
-- GRPO：每 prompt 多回答、组内标准化优势、clipped policy objective 和 reference KL，无 critic。
-
-在线采样温度及特殊 token mask 在概率重算时一致；支持 EOS 与回答上限终止。每卡完整模型副本，通过显式梯度归约进行数据并行，在线 rollout 顺序生成，不包含专家并行或高吞吐推理后端。DPO/reward 以 `val_loss` 保存 best；PPO/GRPO 验证生成奖励，没有伪造 CE `val_loss` 或按 policy loss 选 best。
-
-新增链路仅以微型模型和合成任务完成工程验收，没有正式 RL 能力提升结论。详细数据格式、单卡/八卡命令、奖励模型接入、epoch 语义、恢复与显存边界见 [RL 指南](docs/rl-training-guide.md)。
-
-视觉两条路线、数据下载与转换、从零训练及 VLM 接入命令见训练指南第 9–13 步。小规模 SigLIP 式预训练不是官方训练配方/效果复现；当前新增链路仅完成工程测试。
-
-## 模型规模
-
-文本、视觉适配和 SigLIP 对比训练都支持 `--epochs N`（或训练 JSON 的 `epochs`），按实际数据量和并行配置计算总步数及学习率计划；未指定则继续使用 `max_steps`。CLI 轮数优先，`--stop-after` 只提前停止。恢复时保留原轮数与训练配置，日志显示 `epochs_completed`。尾批处理与完整用法见训练指南第 5.0 步。
+## 模型架构与规模
 
 | 配置 | 总参数 | 每 token 激活参数 | 用途 |
-| --- | ---: | ---: | --- |
-| `configs/moe-base.json` | 264,315,648 | 151,069,440 | 8 卡 3090 的主实验起点 |
-| `configs/moe-small.json` | 48,259,584 | 29,385,216 | 保留的较小对照配置 |
-| `configs/moe-tiny.json` | 约 5 万 | 由 inspect 输出 | 本地合成数据测试，不代表模型能力 |
+|---|---:|---:|---|
+| `configs/moe-base.json` | 264,315,648 | 151,069,440 | 主模型配置 |
+| `configs/moe-small.json` | 48,259,584 | 29,385,216 | 小规模对照 |
+| `configs/moe-tiny.json` | 约 5 万 | 由 `inspect` 输出 | 快速流程测试 |
 
-主配置：16 层、hidden 768、GQA 12/4 heads、4 个 SwiGLU 专家、top-2 路由、16K 词表、最大上下文 2048。支持 Dense FFN（`num_experts=experts_per_token=1`）、RoPE、RMSNorm、共享 embedding、负载均衡损失及 activation checkpointing。
+主模型采用 **16 层、768 hidden size、12 个 attention heads / 4 个 KV heads、4 个专家、top-2 路由、16K 词表和 2048 上下文长度**。每 token 激活参数统计包含完整 embedding 表。
 
-激活参数统计包含完整 embedding 表，与 FLOPs、显存和实测速度不同。用户已提供上面的训练曲线，八卡主模型的完整配置、显存与吞吐仍需结合原始 run 日志核验。PPO 同时涉及多个模型和 rollout，保留小 batch、梯度累积和缩短序列的余地。
+视觉输入经编码器与投影层转换为图像 tokens，与文本 tokens 一起送入解码器。视觉适配默认采用 8×8 图像 token 网格与 Q/V LoRA；编码器、语言基座和 adapter 通过指纹绑定。
 
-## 安装与测试
+## 后训练方法
+
+| 方法 | 数据与目标 | 验证指标 |
+|---|---|---|
+| DPO | 同一问题的 chosen/rejected；冻结 SFT reference，优化回答偏好 | 偏好 loss、偏好准确率 |
+| Reward Model | 独立主干和标量 head，学习成对回答排序 | 排序 loss、偏好准确率 |
+| PPO | 在线生成、任务奖励与 token KL 惩罚，GAE、policy/value clipping | 生成 reward、reference KL |
+| GRPO | 每题生成多个回答，以组相对优势更新策略，加入 reference KL | 生成 reward、reference KL、零方差组比例 |
+
+PPO/GRPO 区分问题集遍历的 `epochs` 和同一批 rollout 重复优化的 `update_epochs`。日志同时记录 prompt 曝光量、生成 tokens、rollout 数量和 optimizer 更新次数。
+
+## 快速开始
+
+使用 [uv](https://docs.astral.sh/uv/) 管理 Python 与依赖，项目版本由 `.python-version` 和 `uv.lock` 固定。在仓库根目录执行：
 
 ```bash
 uv sync --locked
@@ -68,197 +70,118 @@ uv run --locked moe-lab inspect --model-config configs/moe-base.json
 uv run --locked pytest -q
 ```
 
-Python 由 `.python-version` 固定，依赖由 `uv.lock` 固定。当前锁定 PyTorch 2.14.0；Linux 依赖包含 CUDA 13 运行时，服务器驱动必须兼容。正式运行前先检查 `nvidia-smi` 和下面的 CUDA 检查。若服务器驱动不适配，应通过 uv 调整 PyTorch/CUDA 依赖并重新锁定、测试，不使用 pip 手改环境。
+按需启用视觉与绘图依赖：
 
 ```bash
-uv run --locked python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())'
+uv sync --locked --extra vision --extra plot
 ```
 
-本地已验证 CPU。CUDA bf16/fp16、NCCL 与 8 卡吞吐仍需服务器验收；MPS 训练未开放。DDP 测试使用两个本地 CPU/Gloo 进程，需要允许回环网络通信。
-
-## 五分钟检查完整链路
-
-下面全部是 **synthetic fixture + 微型随机初始化模型**，用于验证程序能运行，不用于报告聊天、推理或 RL 能力。输出目录不可已存在，重复运行需使用新目录。
+使用微型模型与合成数据检查文本训练流程；输出目录应使用新名称：
 
 ```bash
-uv run --locked moe-lab prepare --input fixtures/pretrain.jsonl --output data/smoke-pretrain --stage pretrain --max-seq-len 64 --val-ratio 0.25
-uv run --locked moe-lab train --model-config configs/moe-tiny.json --train-config configs/train-smoke-pretrain.json --data data/smoke-pretrain --output runs/smoke-pretrain
-
-uv run --locked moe-lab prepare --input fixtures/sft.jsonl --output data/smoke-sft --stage sft --max-seq-len 64 --val-ratio 0.25
-uv run --locked moe-lab train --model-config configs/moe-tiny.json --train-config configs/train-smoke-sft.json --data data/smoke-sft --init-from runs/smoke-pretrain/step-0000008.pt --output runs/smoke-sft
-
-uv run --locked moe-lab evaluate --checkpoint runs/smoke-sft/step-0000004.pt --data data/smoke-sft
-uv run --locked moe-lab generate --checkpoint runs/smoke-sft/step-0000004.pt --chat --prompt '2+1=?' --temperature 0 --max-new-tokens 16
+uv run --locked python scripts/smoke.py --output runs/text-smoke-001
 ```
 
-几步训练后的输出可能重复或不可读，这是预期行为。要获得有意义的语言能力，需要真实语料和足够训练。
-
-## 正式数据与训练
-
-数据来源、固定版本下载、格式转换和接入命令见 [文本数据指南](docs/data-guide.md)。首轮建议 MiniMind mini 组合（约 2.98 GB 下载）。
-
-预训练 JSONL：
-
-```json
-{"text": "一篇完整文档的内容。"}
-```
-
-SFT JSONL（可选开头 system，随后 user/assistant 交替，最后为 assistant）：
-
-```json
-{"messages": [{"role": "user", "content": "解释什么是专家路由。"}, {"role": "assistant", "content": "专家路由根据输入选择参与计算的专家网络。"}]}
-```
-
-固定分词器后整个训练链路保持一致。BPE 训练与 prepare 使用相同的内容哈希切分，**必须保持 seed 和 val-ratio 相同**；tokenizer 命令跳过划为验证集的文档。不要在外部评测集上训练 tokenizer，也不要把同一评测内容混入另一个阶段的数据。
+检查视觉或后训练流程：
 
 ```bash
-uv run --locked moe-lab tokenizer --input data/raw/pretrain.jsonl --output data/tokenizer.json --vocab-size 16384 --val-ratio 0.05 --seed 42
-uv run --locked moe-lab prepare --input data/raw/pretrain.jsonl --output data/pretrain-v1 --tokenizer data/tokenizer.json --stage pretrain --max-seq-len 512 --val-ratio 0.05 --seed 42
-uv run --locked moe-lab prepare --input data/raw/sft.jsonl --output data/sft-v1 --tokenizer data/tokenizer.json --stage sft --max-seq-len 512 --val-ratio 0.05 --seed 42
+uv run --locked --extra vision python scripts/smoke.py \
+  --output runs/vision-smoke-001 --vision
+uv run --locked python scripts/smoke.py \
+  --output runs/posttrain-smoke-001 --posttrain
 ```
 
-小语料不一定学满 16K 词表。查看 tokenizer 命令输出的实际 `vocab_size`，必要时将模型配置中的值改为一致；训练入口会拒绝不一致的词表。`byte` tokenizer 仅用于快速测试。
+实际语料下载、tokenizer 训练、单卡短跑、多卡正式训练和 checkpoint 选择见[逐步训练指南](docs/training-guide.md)。MiniMind 偏好数据与 GSM8K 的固定版本下载、转换和评测准备见[后训练指南](docs/rl-training-guide.md)。
 
-先单卡短跑，保留原来的 LR schedule，并在第 10 步保存退出：
+## 命令入口
+
+`moe-lab` 是项目 CLI，使用 `uv run --locked moe-lab <command>` 调用；各命令支持 `--help`。
+
+| 阶段 | 命令 |
+|---|---|
+| 环境与模型检查 | `doctor`、`inspect` |
+| 文本数据与训练 | `tokenizer`、`prepare`、`train` |
+| 文本推理与评测 | `generate`、`evaluate` |
+| 视觉数据与适配 | `vision-prepare`、`vision-train` |
+| 图文推理与评测 | `vision-generate`、`vision-evaluate` |
+| 偏好与在线后训练 | `post-prepare`、`post-train`、`post-evaluate` |
+
+SigLIP 图文预训练入口与权重导出方法见[训练指南](docs/training-guide.md)。文本、视觉适配、SigLIP 和后训练均支持 epoch 预算。文本/视觉训练采用 DDP，后训练采用显式梯度归约进行数据并行。
+
+## 实验输出
+
+每次训练使用独立 run 目录，保存配置、指标与恢复状态：
+
+- `run.json`：训练配置、数据及 tokenizer 指纹、模型与运行环境信息。
+- `metrics.jsonl`：各阶段训练/验证指标、学习率、梯度和计算开销。
+- `step-*.pt`：模型或视觉 adapter、优化器、随机状态与数据进度。
+- `summary.json`：末次训练及验证结果。
+- `best.json`：使用验证 loss 的阶段中，记录最低 loss 对应的 checkpoint。
+- `rollouts-rankXXX.jsonl`：PPO/GRPO 在线生成的回答、token IDs 和任务奖励。
+
+`--init-from` 用于加载权重开启新阶段，`--resume` 用于恢复同一个实验的优化器和数据进度；恢复会核对配置与来源指纹。视觉生成需要对应的文本基座、编码器和 adapter。
+
+## 训练曲线
+
+下图展示文本与视觉训练阶段的训练 loss、MoE 辅助 loss 和验证 loss。
+
+<details open>
+<summary>文本预训练与指令微调</summary>
+
+![文本预训练损失曲线](docs/figs/text-pretrain-loss.png)
+
+![文本 SFT 损失曲线](docs/figs/text-sft-001-loss.png)
+
+</details>
+
+<details>
+<summary>视觉对齐与视觉指令微调</summary>
+
+![视觉对齐损失曲线](docs/figs/vision-align-001-loss.png)
+
+![视觉 SFT 损失曲线](docs/figs/vision-sft-001-loss.png)
+
+</details>
+
+绘制文本/视觉 loss：
 
 ```bash
-uv run --locked moe-lab train --model-config configs/moe-base.json --train-config configs/train-pretrain.json --data data/pretrain-v1 --tokenizer data/tokenizer.json --output runs/base-pilot --stop-after 10
+uv run --locked --extra plot python scripts/plot_training.py \
+  --runs runs/text-pretrain-001 --output reports/text-pretrain-loss.png \
+  --smooth-window 50
 ```
 
-单卡验证后，8 卡独立启动一个正式 run：
+绘制后训练 reward、KL 与诊断指标：
 
 ```bash
-uv run --locked torchrun --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli train --model-config configs/moe-base.json --train-config configs/train-pretrain.json --data data/pretrain-v1 --tokenizer data/tokenizer.json --output runs/base-pretrain-001
+uv run --locked --extra plot python scripts/plot_posttraining.py \
+  --runs runs/post-ppo-001 --output reports/post-ppo-metrics.png \
+  --smooth-window 20
 ```
 
-8 卡 SFT：
+绘图只读取日志，支持多个 run 对比及 PNG/PDF/SVG 导出；验证指标保留实际评测点。
 
-```bash
-uv run --locked torchrun --standalone --nnodes=1 --nproc-per-node=8 -m moe_llm.cli train --model-config configs/moe-base.json --train-config configs/train-sft.json --data data/sft-v1 --tokenizer data/tokenizer.json --init-from runs/base-pretrain-001/step-0001000.pt --output runs/base-sft-001
-```
-
-`train-pretrain.json` 的 1000 steps 是启动配置，不是“完成预训练”的质量保证。按有效 token 数、验证 loss 与抽样结果决定训练预算。当前默认全局每步最多 8 卡 × 1 样本 × 8 次累积 × 512 tokens；padding 与 SFT mask 会减少有效监督 tokens。
-
-## 恢复与输出
-
-`--init-from` 只加载权重，开启新的优化器与 schedule，用于预训练 → SFT。`--resume` 恢复同一个训练过程，要求模型/训练配置、数据、tokenizer、代码指纹、PyTorch 版本、设备类型和 world size 不变；**恢复也写入新的目录**。
-
-```bash
-uv run --locked moe-lab train --model-config configs/moe-base.json --train-config configs/train-pretrain.json --data data/pretrain-v1 --tokenizer data/tokenizer.json --resume runs/base-pilot/step-0000010.pt --output runs/base-pilot-resumed
-```
-
-不能将单卡 checkpoint 通过 `--resume` 变成 8 卡 run；可以使用 `--init-from` 开启新实验，但会重置优化器与数据进度。GPU 数值误差可能影响重复运行，CPU 上已验证同配置恢复的逐参数一致性。
-
-每个 run 保存：
-
-- `run.json`：完整配置、参数量、数据/tokenizer/代码指纹、父 checkpoint 指纹、版本与设备信息。
-- `metrics.jsonl`：CE、验证 loss/perplexity、辅助损失、路由熵、各层专家占用、学习率、梯度范数、有效 tokens、运行时间与 CUDA 峰值显存。
-- `step-*.pt`：模型、优化器、AMP scaler、每 rank 的随机状态、数据 epoch/cursor。checkpoint 较大，主模型的 Adam 状态和权重会占用数 GB，应按磁盘预算调整 save_every。
-- `summary.json`：末次指标；BPE run 同时保存 tokenizer 副本。
-
-checkpoint 仅加载张量与基本容器（`weights_only=True`）。不要使用来源不可信的模型文件。
-
-## 阅读顺序与后续计划
-
-1. `src/moe_llm/model.py`：从注意力到专家路由，再到整个解码器。
-2. `src/moe_llm/tokenizer.py`、`data.py`：角色标记、监督 mask、shift、切分与 mmap 数据。
-3. `src/moe_llm/training.py`：loss 归一化、梯度累积、DDP、评测与恢复。
-4. `tests/`：对照测试解释每个模块应该满足的性质。
-
-## 视觉扩展（文本 SFT 完成后使用）
-
-```bash
-uv sync --locked --extra vision
-uv run --locked --extra vision pytest -q
-uv run --locked --extra vision python scripts/smoke.py --output runs/full-smoke-001 --vision
-```
-
-视觉训练分 `align`（仅 projector）和 `sft`（projector + Q/V LoRA）。原文本权重和 tokenizer 不变，无图片时视觉 LoRA 关闭，图片会话启用。第一版不更新共享语言权重，不实现始终启用 LoRA 的混合模态训练。
-
-`vision-siglip.json` 是正式视觉配置；`vision-fixture.json` 只用于随机视觉编码器的工程测试。支持一张图、多轮对话、固定图像尺寸、DDP、AMP、梯度累积、恢复、独立 adapter checkpoint。视觉 checkpoint 必须与原文本 SFT 基座和冻结编码器一起使用。
-
-新命令：`vision-prepare`、`vision-train`、`vision-generate`、`vision-evaluate`、`vision-fixture`。`vision-evaluate --text-data ...` 比较 VLM 无图路径与原基座的 logits；`--zero-images` 提供图像置零对照。详见训练指南第 9–13 步。
-
-`train` 和 `vision-train` 均支持 `--eval-max-batches N`：每次定期/末尾验证每卡最多 N 批，不传则全量验证。短跑建议 `--stop-after 9 --eval-max-batches 9`，正式训练示例采用每卡 128 批，并在训练后单独全量评测。独立 `vision-evaluate` 不继承训练上限；SigLIP 对比训练使用配置中的 `eval_samples`。
-
-## 参考项目
-
-本项目的学习路线与实现设计参考了 [MiniMind](https://github.com/jingyaogong/minimind) 和 [MiniMind-V](https://github.com/jingyaogong/minimind-v)：前者提供小型语言模型从网络搭建到预训练、SFT 的实践参考，后者提供视觉编码器、投影层与语言模型连接的 VLM 实践参考。感谢两个项目的开源工作。相关数据来源与许可证另见 [数据指南](docs/data-guide.md) 和训练指南第 10 步。
-
-本项目实现了原生 PyTorch MoE、两种视觉权重来源，以及有图启用、无图关闭的视觉 LoRA，并检查纯文本路径与原始基座一致。MiniMind-V 本身也支持纯文本和 MoE；这些支持不能作为本项目独有的功能，也尚无实验结论证明本项目效果优于参考项目。
-
-[逐步训练指南](docs/training-guide.md) · [实现细节与限制](docs/design.md) · [后续路线](docs/roadmap.md) · [本地验证记录](docs/validation.md)
-
-## 训练终端进度条
-
-文本 `train`、视觉 `vision-train` 和 SigLIP `train` 在交互终端自动显示底部进度条；八卡只由 rank 0 输出。使用 `--epochs N` 时显示当前轮次和本轮优化器步数，例如：
+## 代码结构
 
 ```text
-Epoch 1/2 [###---------] 250/1000 train=3.2100 val=3.4800@200 train ETA=900s
+src/moe_llm/
+├── model.py                 # MoE 解码器与专家路由
+├── tokenizer.py / data.py   # BPE、文本切分与监督数据
+├── training.py             # 文本预训练与 SFT
+├── siglip*.py              # 图文编码器与对比训练
+├── vision*.py / lora.py     # VLM、视觉适配与评测
+├── posttrain*.py            # 偏好数据与后训练
+├── rl_objectives.py         # DPO、PPO、GRPO 数学目标
+└── cli.py                  # 命令行入口
+configs/                    # 模型与训练配置
+scripts/                    # 下载、转换、流程检查与绘图
+fixtures/                   # 测试用合成数据
+tests/                     # 网络、训练数学与恢复测试
+docs/                      # 训练指南与设计文档
 ```
 
-每次更新的 JSON 指标打印在进度条上方，`metrics.jsonl` 格式保持不变。`train` 是当前更新的训练 loss；`val` 是最近一次实际验证的 loss，`@200` 表示来自全局第 200 步，首次验证前为 `--`。验证仍只在 `eval_every` 和本次结束时执行，不会为了刷新进度条每步验证。验证/保存期间状态为 `validate` / `save`。
+## 参考与致谢
 
-轮末显示本轮 100%；下一轮首步切换轮次。恢复从 checkpoint 已完成的步数继续；`--stop-after` 不缩短进度条的完整预算，提前结束显示 `stopped`。未设置 epochs 时显示全局 Steps。ETA 根据本次运行平均更新速度估算，包含已发生的验证/保存等开销，不代表精确完成时间。
+项目参考了 [MiniMind](https://github.com/jingyaogong/minimind) 的小型语言模型训练实践，以及 [MiniMind-V](https://github.com/jingyaogong/minimind-v) 的视觉编码器与语言模型连接方式。感谢相关项目的开源工作。
 
-重定向到文件或普通管道时自动使用纯 JSON 行，避免控制字符污染日志。`MOE_LAB_PROGRESS=0` 可手动关闭进度条；支持终端控制字符的环境可用 `MOE_LAB_PROGRESS=1` 强制开启（经 `tee` 时文件也会记录控制字符）。无需新增 CLI 参数。
-
-本次代码更新会改变严格恢复的代码指纹。正在运行或需要精确 resume 的旧实验继续使用原代码；完成后再更新，新实验使用新显示。不要为进度条绕过恢复校验。
-
-## 绘制训练损失曲线
-
-读取已有 `metrics.jsonl`，无需加载 checkpoint 或重新训练。服务器无需图形桌面，支持 PNG/PDF/SVG。`train_loss`、`aux_loss`、`val_loss` 分成三个面板，避免不同数值范围挤在同一坐标轴上。
-
-```bash
-uv run --locked --extra plot python scripts/plot_training.py \
-  --runs runs/text-pretrain-001 \
-  --output reports/text-pretrain-001-loss.png
-```
-
-`--runs` 支持 run 目录或 JSONL 文件，也支持多个目录做对比。以下同时保留原始训练/辅助损失浅色线，叠加最近 50 次更新的均值；验证值不平滑、不补齐到每一步：
-
-```bash
-uv run --locked --extra plot python scripts/plot_training.py \
-  --runs runs/text-pretrain-001 runs/text-pretrain-001-resumed \
-  --labels original resumed --smooth-window 50 \
-  --output reports/text-pretrain-comparison.png
-```
-
-恢复目录保留全局 step，作为独立曲线显示，不自动连接或合并多个 run。比较不同实验时保持数据、精度与验证范围一致；文本预训练、SFT 和 SigLIP 的 loss 不能当作同一任务直接比较。SigLIP 没有 aux_loss，该面板标记未记录/不适用。
-
-训练期间也可执行，会跳过尚未写完的最后一行；图表是运行脚本时的快照，不自动刷新。已有报告不覆盖，再次绘图请换输出文件名。缺少验证记录时显示未记录，绝不使用 train_loss 代替 val_loss。
-
-若当前训练仍在进行，建议等结束再同步依赖与运行 uv 绘图，以免 uv 同步环境影响活动实验；只需要已有日志，不必为了画图重启训练。
-
-## 自动保存最佳 checkpoint（val_loss 最低）
-
-文本预训练/SFT、视觉对齐/SFT、SigLIP 训练均自动启用，无需新增参数。每次实际验证后，只要有限的 `val_loss` 严格下降，就保存对应 `step-XXXXXXX.pt`，即使该步没有到 `save_every`；相同 loss 保留较早版本。原来的定期保存与末尾保存继续生效，同一步只保存一次。
-
-run 目录新增 `best.json`，包含 `step`、`val_loss`、`checkpoint`（绝对路径）与验证范围。checkpoint 内保存历史最佳信息，`summary.json` 也包含 `best`。不额外复制一份大型 `best.pt`；历史改善步骤文件保留，注意磁盘空间。
-
-训练后读取最佳权重并生成文本：
-
-```bash
-BEST=$(uv run --locked python - runs/epoch1-20260929-pretrain <<'PY'
-import json, sys
-from pathlib import Path
-best = json.loads((Path(sys.argv[1]) / 'best.json').read_text())
-p = Path(best['checkpoint'])
-assert p.is_file(), p
-print(p)
-PY
-)
-uv run --locked moe-lab generate --checkpoint "$BEST" \
-  --tokenizer data/tokenizer-v1.json --prompt '机器学习是一种' \
-  --max-new-tokens 128 --temperature 0.8
-```
-
-将目录换成实际 run。文本 SFT 后的生成加 `--chat`；视觉 best 是 adapter，应传给 `vision-generate --checkpoint` 并保持原 `--base-checkpoint`；SigLIP best 可用于 evaluate/export。选择中间 best 不要求训练已完成整轮，所以不要用要求整轮完成的 `final_ckpt` 函数读取它。
-
-精确 `--resume` 继承所加载 checkpoint 保存时的历史最佳值；如果后续没有改善，新目录的 `best.json` 仍指向原目录中的最佳文件，必须保留原文件。恢复旧的中间 checkpoint 不会读取原目录中未来步骤的最佳结果。路径为绝对路径，迁移机器或目录时需保留对应路径，当前不自动迁移历史最佳引用。
-
-恢复要求验证范围保持一致，包括文本/VLM 的 `--eval-max-batches`；不能改变验证子集后沿用旧最低 loss。`--init-from` 只继承模型权重，最佳记录重新开始。没有历史 best 字段的兼容 checkpoint 不追溯旧日志，但仍需通过原有严格代码/配置恢复校验。
-
-使用验证上限时，best 指固定验证子集上的最低 loss，不代表全量验证或问答效果最好。独立全量评测不会自动改写训练 best。建议对 best 与最终 checkpoint 做同条件生成对比。
-
-本次训练器代码更新会改变代码指纹。进行中的旧实验请用原代码完成或续训；不要为了启用 best 绕过严格 resume 校验，新版用于新实验。
+后训练实现参考 [DPO](https://arxiv.org/abs/2305.18290)、[PPO](https://arxiv.org/abs/1707.06347) 与 [DeepSeekMath / GRPO](https://arxiv.org/abs/2402.03300)；视觉训练参考 [SigLIP](https://arxiv.org/abs/2303.15343) 的 sigmoid 图文匹配目标。数据与外部权重的来源、版本及许可证见对应指南。

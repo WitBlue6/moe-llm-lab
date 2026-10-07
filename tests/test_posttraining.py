@@ -111,15 +111,21 @@ def test_learned_reward_route(tmp_path,tiny):
     assert math.isfinite(result['val_reward'])
 
 
-def test_epoch_budget_and_reference_immutability(tmp_path,tiny):
-    base,prefs,_=setup_data(tmp_path,tiny)
+@pytest.mark.parametrize('algorithm', ['dpo', 'reward', 'ppo', 'grpo'])
+def test_epoch_budget_and_reference_immutability(tmp_path,tiny,algorithm):
+    base,prefs,prompts=setup_data(tmp_path,tiny)
+    data = prompts if algorithm in ('ppo', 'grpo') else prefs
     digest=base.read_bytes()
-    c=PosttrainConfig(algorithm='dpo',epochs=1,max_steps=100,warmup_steps=0,
-                     batch_size=3,grad_accum_steps=2,eval_every=100,save_every=100,
+    c=PosttrainConfig(algorithm=algorithm,epochs=1,max_steps=100,warmup_steps=0,
+                     batch_size=7,grad_accum_steps=2,max_new_tokens=2,group_size=2,
+                     update_epochs=2,eval_every=100,save_every=100,
                      eval_max_records=2,device='cpu',precision='fp32')
-    n=len(PosttrainDataset(prefs,'train'))
-    result=train_posttrain(base,c,prefs,'byte',tmp_path/'epoch')
-    assert result['step']==math.ceil(math.ceil(n/3)/2)
+    n=len(PosttrainDataset(data,'train'))
+    result=train_posttrain(base,c,data,'byte',tmp_path/'epoch')
+    assert result['step']==math.ceil(math.ceil(n/7)/2)
+    assert result['optimizer_updates']==result['step']*(2 if algorithm in ('ppo','grpo') else 1)
+    if algorithm in ('ppo','grpo'):
+        assert result['rollout_sequences']==n*(2 if algorithm=='grpo' else 1)
     assert result['epochs_completed']==1
     assert result['prompt_exposures']==n
     assert base.read_bytes()==digest

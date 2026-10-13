@@ -121,6 +121,57 @@ SigLIP 图文预训练入口与权重导出方法见[训练指南](docs/training
 
 `--init-from` 用于加载权重开启新阶段，`--resume` 用于恢复同一个实验的优化器和数据进度；恢复会核对配置与来源指纹。视觉生成需要对应的文本基座、编码器和 adapter。
 
+## 模型表现
+
+模型表现涵盖文本知识问答与多模态选择题任务。仓库模型分数与公开模型成绩分别列出，供了解模型的能力范围。
+
+### LLM：知识与常识选择题
+
+OpenBookQA 包含 500 道测试题，ARC-Easy 包含 2,376 道测试题。采用零样本选项概率评分：`acc` 比较选项总 log-prob，`acc_norm` 按选项字符长度归一化。
+
+| 模型阶段 | OpenBookQA acc | OpenBookQA acc_norm | ARC-Easy acc | ARC-Easy acc_norm |
+|---|---:|---:|---:|---:|
+| 文本 SFT | 12.80% | 24.60% | 30.05% | 30.43% |
+| 视觉 SFT，无图路径 | 12.80% | 24.60% | 30.05% | 30.43% |
+| DPO | 12.60% | 24.60% | 30.09% | 30.72% |
+| PPO | 12.20% | 24.60% | 29.67% | 30.51% |
+
+公开模型参考成绩来自 [MiniMind 模型评测表](https://huggingface.co/jingyaogong/minimind-3-pytorch/blob/main/README.md)。公开表未逐列区分 `acc` 与 `acc_norm`，与仓库分数不构成同协议排名。
+
+| 参考模型 | 参数量 | ARC-Easy，公开报告 | OpenBookQA，公开报告 |
+|---|---:|---:|---:|
+| MiniMind-3 | 64M | 28.49% | 23.60% |
+| MiniMind-3-MoE | 198M | 27.74% | 26.20% |
+| GPT-2 Medium | 360M | 43.60% | 30.20% |
+| TinyLlama-1.1B-Chat | 1.1B | 54.80% | 35.60% |
+| SmolLM2-135M-Instruct | 135M | 58.50% | 32.80% |
+
+模型定位为从零训练与多阶段适配的轻量 MoE：当前文本基准得分约为 OpenBookQA 24.6%（`acc_norm`）、ARC-Easy 30.4%（`acc_norm`）。视觉适配保留原基座的纯文本表现，DPO/PPO 在上述基准上的得分与 SFT 接近。
+
+### VLM：MMStar 图像理解
+
+[MMStar](https://huggingface.co/datasets/Lin-Chen/MMStar) 包含 1,500 道图像选择题。仓库模型使用 bf16 精度，以 A/B/C/D 条件概率评分。
+
+| 视觉 SFT 输入条件 | 正确题数 | 准确率 |
+|---|---:|---:|
+| 正常图片 | 447 / 1,500 | 29.80% |
+| 无图输入 | 426 / 1,500 | 28.40% |
+| 图像张量置零 | 447 / 1,500 | 29.80% |
+| 替换为其他题目的图片 | 447 / 1,500 | 29.80% |
+
+公开视觉模型的参考成绩如下；其生成式评分与仓库条件概率评分不同，不构成同协议排名：
+
+| 参考模型 | MMStar，公开报告 | 来源 |
+|---|---:|---|
+| SmolVLM-256M-Instruct | 34.6% | [官方模型卡](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct#evaluation) |
+| SmolVLM-500M-Instruct | 38.3% | 同上 |
+| SmolVLM-2.2B-Instruct | 41.8% | 同上 |
+| Qwen2-VL-2B-Instruct | 48.0% | [官方模型卡](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) |
+| Idefics2-8B | 49.5% | [Idefics3 官方对比表](https://huggingface.co/HuggingFaceM4/Idefics3-8B-Llama3) |
+| Idefics3-8B | 55.9% | 同上 |
+
+视觉模型提供图文问答与纯文本双路径。MMStar 条件概率得分为 29.8%；正常图、置零图和错图的预测一致，因此该分数不代表已具备稳定的图像理解能力。
+
 ## 训练曲线
 
 下图展示文本与视觉训练阶段的训练 loss、MoE 辅助 loss 和验证 loss。
